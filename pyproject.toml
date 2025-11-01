@@ -1,0 +1,20 @@
+[project]
+name = "takuma-llm-toolkit"
+version = "0.1.0"
+description = "LLM推論のためのユーティリティ集"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv>=1.0",
+    "torch",
+    "transformers>=4.40",
+    "vllm>=0.4.0",
+    "openai>=1.30.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["takuma_llm_toolkit*"]
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
