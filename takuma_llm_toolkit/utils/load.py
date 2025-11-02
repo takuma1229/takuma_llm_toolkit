@@ -9,7 +9,7 @@ from typing import Any, Dict
 _GENERATION_DEFAULTS: Dict[str, Any] = {
     "max_new_tokens": 512,
     "repetition_penalty": 1.1,
-    "temperature": 0.7,
+    "temperature": 1.0,
     "do_sample": True,
     "top_p": 0.95,
     "top_k": 40,
