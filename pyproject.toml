@@ -12,6 +12,20 @@ dependencies = [
     "openai>=1.30.0",
 ]
 
+# メタデータ（必要に応じて編集してください）
+authors = [{ name = "takuma-s" }]
+keywords = ["llm", "nlp", "transformers", "vllm", "openai"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+takuma-llm = "takuma_llm_toolkit.cli:main"
+
 [tool.setuptools.packages.find]
 include = ["takuma_llm_toolkit*"]
 

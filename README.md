@@ -13,6 +13,11 @@
 
    HTTPS＋PATを利用する場合は `pip install "git+https://<TOKEN>@github.com/<OWNER>/<REPO>.git"` のように指定してください。
 
+### 最新バージョンへのアップデート (クライアント側)
+```bash
+pip install -U "git+ssh://git@github.com/takuma1229/takuma_llm_toolkit.git"
+```
+
 ### 環境変数の設定
 
 `.env` または環境変数として以下を設定します（`python-dotenv` が自動読み込み）。
