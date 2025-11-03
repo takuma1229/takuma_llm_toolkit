@@ -5,6 +5,8 @@ import sys
 from dotenv import load_dotenv, find_dotenv
 from takuma_llm_toolkit import TextGenerator
 import inspect
+from takuma_llm_toolkit.cli_args import add_common_args, make_generator_from_args
+from takuma_llm_toolkit.constants import DEFAULT_MODEL, DEFAULT_PROMPT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -40,37 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="使用するモデル名（例: gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct など）",
     )
-    parser.add_argument(
-        "-p", "--prompt", default=None,
-        help="入力プロンプト（未指定時は既定のサンプルを使用）",
-    )
-    parser.add_argument(
-        "-e", "--inference-engine",
-        choices=["normal", "vllm"], default="normal",
-        help="推論エンジン（normal|vllm）。既定: normal",
-    )
-
-    # 生成系
-    parser.add_argument("--max-new-tokens", type=int, default=None, help="最大生成トークン数")
-    parser.add_argument("--repetition-penalty", type=float, default=None, help="反復抑制係数")
-    parser.add_argument("--temperature", type=float, default=None, help="サンプリング温度")
-    parser.add_argument("--top-p", type=float, default=None, help="nucleusサンプリング確率質量")
-    parser.add_argument("--top-k", type=int, default=None, help="上位kサンプリング")
-    parser.add_argument("--do-sample", dest="do_sample", action="store_true", help="サンプリングを有効化")
-    parser.add_argument("--no-do-sample", dest="do_sample", action="store_false", help="サンプリングを無効化")
-    parser.set_defaults(do_sample=None)
-
-    # vLLM系
-    parser.add_argument("--tensor-parallel-size", type=int, default=None, help="テンソル並列数")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=None, help="GPUメモリ利用率(0-1)")
-    parser.add_argument("--max-model-len", type=int, default=None, help="vLLMの最大シーケンス長")
+    add_common_args(parser)
 
     # `argv` が None の場合は `sys.argv[1:]` が用いられる
     args = parser.parse_args(argv)
 
     # 既定値
-    model_name = args.model_name or "meta-llama/Meta-Llama-3-8B-Instruct"
-    prompt = args.prompt or "Backpropagation（誤差逆伝播法）の概要を日本語で説明してください。"
+    model_name = args.model_name or DEFAULT_MODEL
+    prompt = args.prompt or DEFAULT_PROMPT
 
     # 互換: 旧インタラクティブ挙動も維持
     if args.model_name is None and sys.stdin.isatty():
@@ -85,18 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    generator = TextGenerator(
-        inference_engine=args.inference_engine,
-        max_new_tokens=args.max_new_tokens,
-        repetition_penalty=args.repetition_penalty,
-        temperature=args.temperature,
-        do_sample=args.do_sample,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-    )
+    generator = make_generator_from_args(args)
     text = generator.run(model_name, prompt)
     if text is None:
         return 1
