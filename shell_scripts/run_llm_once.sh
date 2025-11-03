@@ -14,13 +14,19 @@
 set -euo pipefail
 export PYTHONUNBUFFERED=1
 
+# 実行ディレクトリを sbatch 提出ディレクトリに固定し、ローカルパッケージを優先
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
+export PYTHONPATH="${PWD}:${PYTHONPATH:-}"
+
 show_usage() {
   cat <<'USAGE'
 run_llm_once.sh — 単発のLLM推論ジョブ（sbatch 直投げ用）
 
 使い方:
-  sbatch shell_scripts/run_llm_once.sh --model MODEL [--engine {normal|vllm}] [--prompt TEXT | --prompt-file PATH] [--python PATH]
-  sbatch shell_scripts/run_llm_once.sh -m MODEL [-e {normal|vllm}] [-p TEXT | -f PATH] [-P PATH]
+  sbatch shell_scripts/run_llm_once.sh \
+    --model MODEL [--engine {normal|vllm}] [--prompt TEXT | --prompt-file PATH] [--python PATH] \
+    [--max-new-tokens N] [--repetition-penalty X] [--temperature X] [--top-p X] [--top-k N] [--do-sample|--no-do-sample] \
+    [--tensor-parallel-size N] [--gpu-memory-utilization X]
 
 必須:
   -m, --model MODEL           使用するモデル名
@@ -30,6 +36,15 @@ run_llm_once.sh — 単発のLLM推論ジョブ（sbatch 直投げ用）
   -p, --prompt TEXT           入力プロンプト文字列
   -f, --prompt-file PATH      プロンプトファイル（指定時は --prompt より優先）
   -P, --python PATH           Python 実行コマンド（既定: python）
+  --max-new-tokens N          生成トークン数の上限
+  --repetition-penalty X      反復抑制係数
+  --temperature X             サンプリング温度
+  --top-p X                   nucleus サンプリングの確率質量
+  --top-k N                   上位kサンプリング
+  --do-sample | --no-do-sample サンプリング有効/無効
+  --tensor-parallel-size N    vLLM テンソル並列数
+  --gpu-memory-utilization X  vLLM GPUメモリ使用率(0-1)
+  --max-model-len N           vLLM の最大シーケンス長
   -h, --help                  このヘルプを表示
 
 例:
@@ -45,6 +60,15 @@ ENGINE_OPT=""
 PROMPT_OPT=""
 PROMPT_FILE_OPT=""
 PYTHON_OPT=""
+MAX_NEW_TOKENS_OPT=""
+REPETITION_PENALTY_OPT=""
+TEMPERATURE_OPT=""
+TOP_P_OPT=""
+TOP_K_OPT=""
+DO_SAMPLE_FLAG=""   # --do-sample または --no-do-sample
+TP_SIZE_OPT=""
+GPU_MEM_UTIL_OPT=""
+MAX_MODEL_LEN_OPT=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -m|--model) MODEL="${2:-}"; shift 2;;
@@ -52,6 +76,16 @@ while [[ $# -gt 0 ]]; do
     -p|--prompt) PROMPT_OPT="${2:-}"; PROMPT_FILE_OPT=""; shift 2;;
     -f|--prompt-file) PROMPT_FILE_OPT="${2:-}"; shift 2;;
     -P|--python) PYTHON_OPT="${2:-}"; shift 2;;
+    --max-new-tokens) MAX_NEW_TOKENS_OPT="${2:-}"; shift 2;;
+    --repetition-penalty) REPETITION_PENALTY_OPT="${2:-}"; shift 2;;
+    --temperature) TEMPERATURE_OPT="${2:-}"; shift 2;;
+    --top-p) TOP_P_OPT="${2:-}"; shift 2;;
+    --top-k) TOP_K_OPT="${2:-}"; shift 2;;
+    --do-sample) DO_SAMPLE_FLAG="--do-sample"; shift 1;;
+    --no-do-sample) DO_SAMPLE_FLAG="--no-do-sample"; shift 1;;
+    --tensor-parallel-size) TP_SIZE_OPT="${2:-}"; shift 2;;
+    --gpu-memory-utilization) GPU_MEM_UTIL_OPT="${2:-}"; shift 2;;
+    --max-model-len) MAX_MODEL_LEN_OPT="${2:-}"; shift 2;;
     -h|--help)  show_usage; exit 0;;
     -*) echo "Error: 不明なオプション: $1" >&2; show_usage >&2; exit 2;;
     *)  if [[ -z "${MODEL}" ]]; then MODEL="$1"; else echo "Error: 余分な引数: $1" >&2; exit 2; fi; shift;;
@@ -122,7 +156,18 @@ echo "[RUNNER] Model      : ${MODEL}"
 echo "[RUNNER] PromptLen  : ${#PROMPT} chars"
 echo "[RUNNER] Python(bin): $(command -v "${PYTHON}" || which python || true)"
 
-# 実行（-u: 行単位フラッシュ）
-srun -u "${PYTHON}" run_llm.py -e "${ENGINE}" "${MODEL}" -p "${PROMPT}"
+# 実行（-u: 行単位フラッシュ）— オプションを適宜付与
+ARGS=( -e "${ENGINE}" "${MODEL}" -p "${PROMPT}" )
+[[ -n "${MAX_NEW_TOKENS_OPT}" ]] && ARGS+=( --max-new-tokens "${MAX_NEW_TOKENS_OPT}" )
+[[ -n "${REPETITION_PENALTY_OPT}" ]] && ARGS+=( --repetition-penalty "${REPETITION_PENALTY_OPT}" )
+[[ -n "${TEMPERATURE_OPT}" ]] && ARGS+=( --temperature "${TEMPERATURE_OPT}" )
+[[ -n "${TOP_P_OPT}" ]] && ARGS+=( --top-p "${TOP_P_OPT}" )
+[[ -n "${TOP_K_OPT}" ]] && ARGS+=( --top-k "${TOP_K_OPT}" )
+[[ -n "${DO_SAMPLE_FLAG}" ]] && ARGS+=( ${DO_SAMPLE_FLAG} )
+[[ -n "${TP_SIZE_OPT}" ]] && ARGS+=( --tensor-parallel-size "${TP_SIZE_OPT}" )
+[[ -n "${GPU_MEM_UTIL_OPT}" ]] && ARGS+=( --gpu-memory-utilization "${GPU_MEM_UTIL_OPT}" )
+[[ -n "${MAX_MODEL_LEN_OPT}" ]] && ARGS+=( --max-model-len "${MAX_MODEL_LEN_OPT}" )
+
+srun -u "${PYTHON}" run_llm.py "${ARGS[@]}"
 
 echo "---- 実行が終了しました ----"

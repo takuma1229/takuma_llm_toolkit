@@ -27,23 +27,37 @@ def main(argv: list[str] | None = None) -> int:
         prog="takuma-llm",
         description="takuma-llm-toolkit のCLIから手早く推論します。",
     )
-    parser.add_argument(
-        "model_name",
-        nargs="?",
-        default="meta-llama/Meta-Llama-3-8B-Instruct",
-        help="モデル名（例: gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct など）",
-    )
-    parser.add_argument(
-        "-p",
-        "--prompt",
-        default="日本語で3行自己紹介して",
-        help="入力プロンプト",
-    )
+    parser.add_argument("model_name", nargs="?", default="meta-llama/Meta-Llama-3-8B-Instruct", help="モデル名")
+    parser.add_argument("-p", "--prompt", default="日本語で3行自己紹介して", help="入力プロンプト")
+    parser.add_argument("-e", "--inference-engine", choices=["normal", "vllm"], default="normal", help="推論エンジン")
+
+    # 生成系
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--do-sample", dest="do_sample", action="store_true")
+    parser.add_argument("--no-do-sample", dest="do_sample", action="store_false")
+    parser.set_defaults(do_sample=None)
+
+    # vLLM系
+    parser.add_argument("--tensor-parallel-size", type=int, default=None)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=None)
 
     args = parser.parse_args(argv)
 
-    # 既定は従来挙動を維持するため "normal" を指定
-    gen = TextGenerator(inference_engine="normal")
+    gen = TextGenerator(
+        inference_engine=args.inference_engine,
+        max_new_tokens=args.max_new_tokens,
+        repetition_penalty=args.repetition_penalty,
+        temperature=args.temperature,
+        do_sample=args.do_sample,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        tensor_parallel_size=args.tensor_parallel_size,
+        gpu_memory_utilization=args.gpu_memory_utilization,
+    )
     text = gen.run(args.model_name, args.prompt)
     if text is None:
         return 1
