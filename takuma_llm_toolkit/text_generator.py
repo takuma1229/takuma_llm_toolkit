@@ -32,11 +32,23 @@ class TextGenerator:
 
     Parameters
     ----------
+    inference_engine : {"normal", "vllm"}
+        推論エンジンの種別。``"normal"`` は従来挙動（公式実装優先、
+        ただし Llama のベースモデルは従来どおり vLLM を使用）。
+        ``"vllm"`` は vLLM による推論を優先（未対応モデルは公式へフォールバック）。
     config : Config or dict, optional
         生成設定を上書きするための辞書。
+    gpu_memory_utilization : float, optional
+        vLLMエンジン使用時の GPU メモリ使用率（0.0〜1.0）。
+        ``None`` の場合、モデル名から概算した値を初回利用時に自動設定します。
+    tensor_parallel_size : int, optional
+        vLLMエンジン使用時のテンソル並列数。``None`` の場合、
+        利用可能な GPU 台数（最低1）を初回利用時に自動設定します。
 
     Attributes
     ----------
+    inference_engine : str
+        選択された推論エンジン。
     openai_api_key : str or None
         OpenAI APIのキー。
     hf_token : str
@@ -45,9 +57,26 @@ class TextGenerator:
         DeepSeekのAPIキー。
     device : torch.device
         推論に使用するデバイス。
+    gpu_memory_utilization : float | None
+        vLLM の ``gpu_memory_utilization``。明示しない場合は ``None``（自動推定）。
+    tensor_parallel_size : int | None
+        vLLM の ``tensor_parallel_size``。明示しない場合は ``None``（自動決定）。
     """
 
-    def __init__(self, config: Config | Dict[str, Any] | None = None):
+    def __init__(
+        self,
+        inference_engine: str,
+        config: Config | Dict[str, Any] | None = None,
+        *,
+        gpu_memory_utilization: float | None = 0.9,
+        tensor_parallel_size: int | None = None,
+    ):
+        # 引数バリデーション
+        if inference_engine not in {"normal", "vllm"}:
+            raise ValueError(
+                "inference_engine は 'normal' または 'vllm' を指定してください。"
+            )
+        self.inference_engine = inference_engine
         if isinstance(config, Config):
             self.config = config
         elif isinstance(config, dict):
@@ -64,6 +93,9 @@ class TextGenerator:
         self.pipeline = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.llm: LLM | None = None
+        # vLLM関連パラメータをクラス属性として保持
+        self.gpu_memory_utilization: float | None = gpu_memory_utilization
+        self.tensor_parallel_size: int | None = tensor_parallel_size
         # bitsandbytes / triton が無い環境では自動で非量子化へフォールバック
         self.enable_bnb = self._should_enable_bnb()
         self.quantization_config = (
@@ -109,6 +141,7 @@ class TextGenerator:
             except Exception:
                 logger.info("visible_gpus=%d", torch.cuda.device_count())
         logger.info("model_name: %s", model_name)
+        logger.info("inference_engine: %s", self.inference_engine)
         safe_keys = {
             "device": self.device,
             "max_new_tokens": self.max_new_tokens,
@@ -120,18 +153,40 @@ class TextGenerator:
         }
         logger.info("runtime_config: %s", safe_keys)
 
-        if "llama" in model_name or "Llama" in model_name:
-            if is_base_model_flag:
-                response = self.llama_base_vllm(model_name, prompt)
+        # エンジン選択に基づく分岐
+        if self.inference_engine == "vllm":
+            if "llama" in model_name or "Llama" in model_name:
+                if is_base_model_flag:
+                    response = self.llama_base_vllm(model_name, prompt)
+                else:
+                    response = self.llama_vllm(model_name, prompt)
+            elif "Qwen" in model_name:
+                response = self.qwen_vllm(model_name, prompt)
+            elif "phi" in model_name or "Phi" in model_name:
+                logger.warning(
+                    "phi 系で vLLM は未対応のため、公式実装へフォールバックします。"
+                )
+                response = self.phi_official(model_name, prompt)
             else:
-                response = self.llama_official(model_name, prompt)
-        elif "Qwen" in model_name:
-            response = self.qwen_official(model_name, prompt)
-        elif "phi" in model_name or "Phi" in model_name:
-            response = self.phi_official(model_name, prompt)
-        else:
-            logger.warning("Unexpected model name: %s", model_name)
-            response = self.run_openai_gpt(prompt, model_name)
+                logger.warning(
+                    "vLLM未対応モデルのためOpenAI経路にフォールバックします: %s",
+                    model_name,
+                )
+                response = self.run_openai_gpt(prompt, model_name)
+        else:  # normal: 従来挙動を維持（公式実装優先）
+            if "llama" in model_name or "Llama" in model_name:
+                if is_base_model_flag:
+                    # 従来どおり、Llamaベースモデルは vLLM を使用
+                    response = self.llama_base_vllm(model_name, prompt)
+                else:
+                    response = self.llama_official(model_name, prompt)
+            elif "Qwen" in model_name:
+                response = self.qwen_official(model_name, prompt)
+            elif "phi" in model_name or "Phi" in model_name:
+                response = self.phi_official(model_name, prompt)
+            else:
+                logger.warning("Unexpected model name: %s", model_name)
+                response = self.run_openai_gpt(prompt, model_name)
 
         print(f"Generated Text: \n\n{response}")
         return response
@@ -160,12 +215,19 @@ class TextGenerator:
                     model=model_name,
                     model_kwargs={
                         "dtype": torch.bfloat16,
-                        **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+                        **(
+                            {"quantization_config": self.quantization_config}
+                            if self.quantization_config
+                            else {}
+                        ),
                     },
                     device_map="auto",
                 )
             except Exception as e:
-                logger.warning("BitsAndBytes量子化でのロードに失敗したため、非量子化で再試行します: %s", e)
+                logger.warning(
+                    "BitsAndBytes量子化でのロードに失敗したため、非量子化で再試行します: %s",
+                    e,
+                )
                 self.pipeline = transformers.pipeline(
                     "text-generation",
                     model=model_name,
@@ -218,15 +280,21 @@ class TextGenerator:
         )
 
         if self.llm is None:
-            tps = max(1, torch.cuda.device_count())
-            try:
-                gmu = min(0.95, float(estimate_gpu_utilization(model_name)))
-            except Exception:
-                gmu = 0.9
+            # クラス属性が未設定なら初回利用時に自動決定して確定させる
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
+
             self.llm = LLM(
                 model=model_name,
-                tensor_parallel_size=tps,
-                gpu_memory_utilization=gmu,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=15000,
             )
 
@@ -270,15 +338,19 @@ class TextGenerator:
         )
 
         if self.llm is None:
-            tps = max(1, torch.cuda.device_count())
-            try:
-                gmu = min(0.95, float(estimate_gpu_utilization(model_name)))
-            except Exception:
-                gmu = 0.9
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
             self.llm = LLM(
                 model=model_name,
-                tensor_parallel_size=tps,
-                gpu_memory_utilization=gmu,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
             )
 
         outputs = self.llm.generate([prompt], sampling_params)
@@ -311,10 +383,16 @@ class TextGenerator:
                     model_name,
                     torch_dtype="auto",
                     device_map="auto",
-                    **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+                    **(
+                        {"quantization_config": self.quantization_config}
+                        if self.quantization_config
+                        else {}
+                    ),
                 )
             except Exception as e:
-                logger.warning("量子化ロードに失敗したため、非量子化で再試行します: %s", e)
+                logger.warning(
+                    "量子化ロードに失敗したため、非量子化で再試行します: %s", e
+                )
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype="auto",
@@ -377,15 +455,19 @@ class TextGenerator:
         )
 
         if self.llm is None:
-            tps = max(1, torch.cuda.device_count())
-            try:
-                gmu = min(0.95, float(estimate_gpu_utilization(model_name)))
-            except Exception:
-                gmu = 0.9
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
             self.llm = LLM(
                 model=model_name,
-                tensor_parallel_size=tps,
-                gpu_memory_utilization=gmu,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
                 quantization="bitsandbytes",
                 load_format="bitsandbytes",
             )
@@ -427,12 +509,18 @@ class TextGenerator:
                     model=model_name,
                     model_kwargs={
                         "dtype": "auto",
-                        **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+                        **(
+                            {"quantization_config": self.quantization_config}
+                            if self.quantization_config
+                            else {}
+                        ),
                     },
                     device_map="auto",
                 )
             except Exception as e:
-                logger.warning("量子化ロードに失敗したため、非量子化で再試行します: %s", e)
+                logger.warning(
+                    "量子化ロードに失敗したため、非量子化で再試行します: %s", e
+                )
                 self.pipeline = transformers.pipeline(
                     "text-generation",
                     model=model_name,
@@ -563,7 +651,9 @@ class TextGenerator:
             import bitsandbytes  # noqa: F401
             import triton  # noqa: F401
         except Exception as e:
-            logger.warning("bitsandbytes/triton を検出できないため非量子化にします: %s", e)
+            logger.warning(
+                "bitsandbytes/triton を検出できないため非量子化にします: %s", e
+            )
             return False
         return True
 

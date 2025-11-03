@@ -42,7 +42,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
 
-    gen = TextGenerator()
+    # 既定は従来挙動を維持するため "normal" を指定
+    gen = TextGenerator(inference_engine="normal")
     text = gen.run(args.model_name, args.prompt)
     if text is None:
         return 1
@@ -52,4 +53,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

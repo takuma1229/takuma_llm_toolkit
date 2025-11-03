@@ -38,7 +38,11 @@ pip install -U "git+ssh://git@github.com/takuma1229/takuma_llm_toolkit.git"
 ```python
 from takuma_llm_toolkit import TextGenerator
 
-generator = TextGenerator()
+# 必須引数 `inference_engine` を指定します。
+# - "normal": 従来の公式実装（transformers/pipeline等）。
+#              Llamaのベースモデルのみ内部でvLLMを使用します。
+# - "vllm"  : vLLMを優先的に使用（未対応モデルは公式実装にフォールバック）。
+generator = TextGenerator(inference_engine="normal")
 response = generator.run(
     model_name="meta-llama/Meta-Llama-3-8B-Instruct",
     prompt="バックプロパゲーションの概要を教えて下さい。",

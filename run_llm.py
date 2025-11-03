@@ -40,6 +40,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="入力プロンプト（未指定時は既定のサンプルを使用）",
     )
+    parser.add_argument(
+        "-e",
+        "--inference-engine",
+        choices=["normal", "vllm"],
+        default="normal",
+        help="推論エンジンを指定（normal|vllm）。既定は normal。",
+    )
 
     # `argv` が None の場合は `sys.argv[1:]` が用いられる
     args = parser.parse_args(argv)
@@ -54,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         if entered:
             model_name = entered
 
-    generator = TextGenerator()
+    generator = TextGenerator(inference_engine=args.inference_engine)
     text = generator.run(model_name, prompt)
     if text is None:
         return 1
