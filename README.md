@@ -110,7 +110,7 @@ ValueError: ... max seq len (...) ... KV cache is needed ... available ... Try i
 - `--max-model-len 12000` のようにコンテキスト長を下げる
 - `--tensor-parallel-size` を増やして GPU を分割活用する
 
-備考: 本ツールの既定の `max_model_len` は 512 です。必要に応じて上記オプションで引き上げてください。
+備考: 本ツールの既定の `max_model_len` は 2048 です。必要に応じて上記オプションで調整してください。
 ```
 
 ### バージョン自動更新

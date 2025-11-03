@@ -48,7 +48,7 @@ class TextGenerator:
         vLLMエンジン使用時のテンソル並列数。``None`` の場合、
         利用可能な GPU 台数（最低1）を初回利用時に自動設定します。
     max_model_len : int, optional
-        vLLM 初期化時に指定する最大シーケンス長。未指定時の既定は ``512``。
+        vLLM 初期化時に指定する最大シーケンス長。未指定時の既定は ``2048``。
     max_new_tokens : int, optional
         生成する最大トークン数。
     repetition_penalty : float, optional
@@ -93,7 +93,7 @@ class TextGenerator:
         do_sample: bool | None = None,
         top_p: float | None = None,
         top_k: int | None = None,
-        max_model_len: int | None = 512,
+        max_model_len: int | None = 2048,
     ):
         # 引数バリデーション
         if inference_engine not in {"normal", "vllm"}:
@@ -130,8 +130,8 @@ class TextGenerator:
         # vLLM関連パラメータをクラス属性として保持
         self.gpu_memory_utilization: float | None = gpu_memory_utilization
         self.tensor_parallel_size: int | None = tensor_parallel_size
-        # None で明示的に渡された場合も 512 を既定として採用
-        self.max_model_len: int | None = 512 if max_model_len is None else int(max_model_len)
+        # None で明示的に渡された場合も 2048 を既定として採用
+        self.max_model_len: int | None = 2048 if max_model_len is None else int(max_model_len)
         # bitsandbytes / triton が無い環境では自動で非量子化へフォールバック
         self.enable_bnb = self._should_enable_bnb()
         self.quantization_config = (
