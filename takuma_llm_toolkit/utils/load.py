@@ -3,7 +3,13 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+try:  # Python 3.11+
+    import tomllib as _toml
+except Exception:  # pragma: no cover - 3.11未満では依存を追加する想定はしない
+    _toml = None  # type: ignore
 
 
 _GENERATION_DEFAULTS: Dict[str, Any] = {
@@ -15,58 +21,73 @@ _GENERATION_DEFAULTS: Dict[str, Any] = {
     "top_k": 40,
 }
 
-_GENERATION_ENV_KEYS = {
-    "max_new_tokens": "LLM_MAX_NEW_TOKENS",
-    "repetition_penalty": "LLM_REPETITION_PENALTY",
-    "temperature": "LLM_TEMPERATURE",
-    "do_sample": "LLM_DO_SAMPLE",
-    "top_p": "LLM_TOP_P",
-    "top_k": "LLM_TOP_K",
-}
-
 
 class Config(dict):
     """LLM推論に用いる設定を保持する辞書風のクラス。
 
+    本クラスは次の優先度で設定をマージします。
+
+    1. インスタンス化時に与えた `overrides`
+    2. `Config.toml` の内容（見つかった場合）
+    3. コード内のデフォルト値
+
     Parameters
     ----------
     overrides : dict, optional
-        既定値を上書きするための辞書。
+        既定値やファイル設定を上書きする辞書。
+    config_path : str or Path, optional
+        読み込む設定ファイルのパス。省略時は ``find_config_path()`` で探索します。
 
-    Raises
-    ------
-    ValueError
-        環境変数の値を適切な型に変換できなかった場合。
+    Notes
+    -----
+    旧仕様のような環境変数による上書きは行いません。
+    必要な場合は `overrides` または `Config.toml` を用いてください。
     """
 
-    def __init__(self, overrides: Dict[str, Any] | None = None):
+    def __init__(self, overrides: Dict[str, Any] | None = None, config_path: str | Path | None = None):
         data = self._build_defaults()
+        # 2) Config.toml の読み込み（存在すれば）
+        cfg_path = self._resolve_config_path(config_path)
+        if cfg_path is not None:
+            file_data = self._load_toml(cfg_path)
+            if isinstance(file_data, dict):
+                data = self._merge_dicts(data, file_data)
+        # 1) 明示的上書き
         if overrides:
             data = self._merge_dicts(data, overrides)
         super().__init__(data)
 
     def _build_defaults(self) -> Dict[str, Dict[str, Any]]:
         generation = dict(_GENERATION_DEFAULTS)
-        for key, env_name in _GENERATION_ENV_KEYS.items():
-            raw_value = os.getenv(env_name)
-            if raw_value is None:
-                continue
-            generation[key] = self._coerce_generation_value(key, raw_value)
         return {"generation": generation}
 
-    def _coerce_generation_value(self, key: str, raw_value: str) -> Any:
-        if key in {"max_new_tokens", "top_k"}:
-            return int(raw_value)
-        if key in {"repetition_penalty", "temperature", "top_p"}:
-            return float(raw_value)
-        if key == "do_sample":
-            lowered = raw_value.strip().lower()
-            if lowered in {"1", "true", "t", "yes", "y", "on"}:
-                return True
-            if lowered in {"0", "false", "f", "no", "n", "off"}:
-                return False
-            raise ValueError(f"do_sampleに変換できない値です: {raw_value}")
-        return raw_value
+    def _resolve_config_path(self, config_path: str | Path | None) -> Optional[Path]:
+        if config_path is not None:
+            p = Path(config_path)
+            return p if p.is_file() else None
+        return find_config_path()
+
+    def _load_toml(self, path: Path) -> Dict[str, Any]:
+        """TOML ファイルを読み込み辞書で返す。
+
+        Parameters
+        ----------
+        path : Path
+            読み込む ``Config.toml`` のパス。
+
+        Returns
+        -------
+        dict
+            TOML の内容を辞書として返します。読み込みや解析に失敗した場合は空辞書。
+        """
+        if _toml is None:
+            return {}
+        try:
+            with path.open('rb') as f:
+                data = _toml.load(f)
+            return data or {}
+        except Exception:
+            return {}
 
     def _merge_dicts(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(base)
@@ -102,4 +123,31 @@ def is_base_model(model_name: str) -> bool:
     return any(token in lowered for token in ("-7b", "-8b", "-13b", "llama"))
 
 
-__all__ = ["Config", "is_base_model"]
+def find_config_path(filename: str = "Config.toml") -> Optional[Path]:
+    """`Config.toml` を探索して最初に見つかったパスを返す。
+
+    Parameters
+    ----------
+    filename : str, optional
+        探索する設定ファイル名。既定は ``"Config.toml"``。
+
+    Returns
+    -------
+    Path or None
+        見つかった場合はファイルパス、見つからなければ ``None``。
+
+    Notes
+    -----
+    カレントディレクトリから親ディレクトリへ向けて順次探索します。
+    仮想環境やインストール先から呼び出されるケースでも、
+    実行時の作業ディレクトリ直下の構成を優先的に取り込みます。
+    """
+    start = Path.cwd()
+    for p in [start, *start.parents]:
+        candidate = p / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+__all__ = ["Config", "is_base_model", "find_config_path"]

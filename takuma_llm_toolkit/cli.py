@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import argparse
 from dotenv import load_dotenv, find_dotenv
-
-from . import TextGenerator
+from .cli_args import add_common_args, make_generator_from_args
+from .constants import DEFAULT_MODEL, DEFAULT_PROMPT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -27,23 +27,13 @@ def main(argv: list[str] | None = None) -> int:
         prog="takuma-llm",
         description="takuma-llm-toolkit のCLIから手早く推論します。",
     )
-    parser.add_argument(
-        "model_name",
-        nargs="?",
-        default="meta-llama/Meta-Llama-3-8B-Instruct",
-        help="モデル名（例: gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct など）",
-    )
-    parser.add_argument(
-        "-p",
-        "--prompt",
-        default="日本語で3行自己紹介して",
-        help="入力プロンプト",
-    )
+    parser.add_argument("model_name", nargs="?", default=DEFAULT_MODEL, help="モデル名")
+    add_common_args(parser)
 
     args = parser.parse_args(argv)
 
-    gen = TextGenerator()
-    text = gen.run(args.model_name, args.prompt)
+    gen = make_generator_from_args(args)
+    text = gen.run(args.model_name, args.prompt or DEFAULT_PROMPT)
     if text is None:
         return 1
     print(text)
@@ -52,4 +42,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

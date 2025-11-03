@@ -4,6 +4,9 @@ import argparse
 import sys
 from dotenv import load_dotenv, find_dotenv
 from takuma_llm_toolkit import TextGenerator
+import inspect
+from takuma_llm_toolkit.cli_args import add_common_args, make_generator_from_args
+from takuma_llm_toolkit.constants import DEFAULT_MODEL, DEFAULT_PROMPT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -19,9 +22,14 @@ def main(argv: list[str] | None = None) -> int:
     -------
     int
         プロセスの終了コード。正常終了時は0。
+
+    Notes
+    -----
+    生成系・vLLM系のパラメータはすべてコマンドライン引数から明示指定可能です。
+    未指定項目は Config.toml → 既定値 の順で補完されます。
     """
 
-    # .env を最優先で読み込む（OS環境変数より優先）
+    # .env を最優先で読み込む（APIキー等）。生成パラメータは読みません。
     load_dotenv(find_dotenv(), override=True)
 
     parser = argparse.ArgumentParser(
@@ -34,19 +42,14 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="使用するモデル名（例: gpt-4o-mini, Qwen/Qwen2.5-7B-Instruct など）",
     )
-    parser.add_argument(
-        "-p",
-        "--prompt",
-        default=None,
-        help="入力プロンプト（未指定時は既定のサンプルを使用）",
-    )
+    add_common_args(parser)
 
     # `argv` が None の場合は `sys.argv[1:]` が用いられる
     args = parser.parse_args(argv)
 
     # 既定値
-    model_name = args.model_name or "meta-llama/Meta-Llama-3-8B-Instruct"
-    prompt = args.prompt or "Backpropagation（誤差逆伝播法）の概要を日本語で説明してください。"
+    model_name = args.model_name or DEFAULT_MODEL
+    prompt = args.prompt or DEFAULT_PROMPT
 
     # 互換: 旧インタラクティブ挙動も維持
     if args.model_name is None and sys.stdin.isatty():
@@ -54,7 +57,14 @@ def main(argv: list[str] | None = None) -> int:
         if entered:
             model_name = entered
 
-    generator = TextGenerator()
+    # デバッグ: どの TextGenerator が使われているか明示
+    try:
+        path = inspect.getsourcefile(TextGenerator) or "<unknown>"
+        print(f"[DEBUG] TextGenerator loaded from: {path}")
+    except Exception:
+        pass
+
+    generator = make_generator_from_args(args)
     text = generator.run(model_name, prompt)
     if text is None:
         return 1

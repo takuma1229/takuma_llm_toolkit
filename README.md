@@ -18,28 +18,59 @@
 pip install -U "git+ssh://git@github.com/takuma1229/takuma_llm_toolkit.git"
 ```
 
-### 環境変数の設定
+### 環境変数（APIキー等）
 
 `.env` または環境変数として以下を設定します（`python-dotenv` が自動読み込み）。
 
-- `HF_TOKEN` : 必須。Hugging Faceのアクセストークン。
-- `OPENAI_API_KEY` : OpenAI APIを利用する場合に設定。
-- `DEEPSEEK_API_KEY` : DeepSeek APIを利用する場合に設定。
-- 必要に応じて生成パラメータを上書きする環境変数：
-  - `LLM_MAX_NEW_TOKENS`
-  - `LLM_REPETITION_PENALTY`
-  - `LLM_TEMPERATURE`
-  - `LLM_DO_SAMPLE`
-  - `LLM_TOP_P`
-  - `LLM_TOP_K`
+- `HF_TOKEN` : 必須。Hugging Face のアクセストークン。
+- `OPENAI_API_KEY` : OpenAI API を利用する場合に設定。
+- `DEEPSEEK_API_KEY` : DeepSeek API を利用する場合に設定。
+
+生成パラメータ（max_new_tokens 等）の上書きを環境変数では行いません。下記「設定の優先度」に従い、明示引数または Config.toml を利用してください。
+
+### 設定の優先度
+
+高い → 低い の順に適用されます。
+
+1. TextGenerator のコンストラクタ引数（明示指定）
+2. Config.toml の値
+3. ライブラリ内のデフォルト
+
+Config.toml はカレントディレクトリから親に向かって探索され、最初に見つかったものが読み込まれます。
+
+サンプル（Config.toml）:
+
+```toml
+[generation]
+max_new_tokens = 256
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+repetition_penalty = 1.1
+do_sample = true
+```
 
 ### Pythonからの利用例
 
 ```python
 from takuma_llm_toolkit import TextGenerator
 
-generator = TextGenerator()
-response = generator.run(
+# 必須: inference_engine（"normal" または "vllm"）
+gen = TextGenerator(
+    inference_engine="vllm",
+    # 生成系（任意）: 未指定は Config.toml → 既定
+    max_new_tokens=256,
+    temperature=0.7,
+    top_p=0.9,
+    top_k=40,
+    repetition_penalty=1.1,
+    do_sample=True,
+    # vLLM 系（任意）
+    # tensor_parallel_size=2,
+    # gpu_memory_utilization=0.85,
+)
+
+response = gen.run(
     model_name="meta-llama/Meta-Llama-3-8B-Instruct",
     prompt="バックプロパゲーションの概要を教えて下さい。",
 )
@@ -51,10 +82,36 @@ print(response)
 このリポジトリ内の `run_llm.py` はエントリーポイントの例です。Pythonモジュールとしてインストール後に直接実行しても同様に利用できます。
 
 ```bash
-python run_llm.py
+# 例: vLLM で推論、生成パラメータを明示指定
+python run_llm.py -e vllm \
+  --max-new-tokens 256 --temperature 0.7 --top-p 0.9 --top-k 40 --repetition-penalty 1.1 --do-sample \
+  --tensor-parallel-size 1 --gpu-memory-utilization 0.9 --max-model-len 12000 \
+  meta-llama/Meta-Llama-3-8B-Instruct -p "こんにちは！"
 ```
 
-プロンプト入力後、指定モデルで推論が実行されます。
+SLURM に直接投げる場合は `shell_scripts/run_llm_once.sh` を使います。
+
+```bash
+sbatch --gres=gpu:1 shell_scripts/run_llm_once.sh \
+  -m meta-llama/Meta-Llama-3-8B-Instruct -e vllm -p "こんにちは！" \
+  --max-new-tokens 256 --temperature 0.7 --top-p 0.9 --top-k 40 --repetition-penalty 1.1 --do-sample \
+  --tensor-parallel-size 1 --gpu-memory-utilization 0.9 --max-model-len 12000
+
+トラブルシュート（vLLM の KV キャッシュ不足エラー）
+
+vLLM 初期化時に下記のようなエラーが出る場合は、GPU メモリに対して `max_model_len` が大きすぎるか、`gpu_memory_utilization` が小さすぎます。
+
+```
+ValueError: ... max seq len (...) ... KV cache is needed ... available ... Try increasing `gpu_memory_utilization` or decreasing `max_model_len` ...
+```
+
+対処例:
+- `--gpu-memory-utilization 0.95` に上げる
+- `--max-model-len 12000` のようにコンテキスト長を下げる
+- `--tensor-parallel-size` を増やして GPU を分割活用する
+
+備考: 本ツールの既定の `max_model_len` は 2048 です。必要に応じて上記オプションで調整してください。
+```
 
 ### バージョン自動更新
 

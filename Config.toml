@@ -1,0 +1,12 @@
+# takuma-llm-toolkit 設定ファイル
+# 優先度: コンストラクタ引数 > Config.toml > ライブラリ既定
+
+[generation]
+# 生成パラメータ（必要に応じて変更してください）
+max_new_tokens = 512
+repetition_penalty = 1.1
+temperature = 1.0
+do_sample = true
+top_p = 0.95
+top_k = 40
+
