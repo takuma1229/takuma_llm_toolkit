@@ -18,7 +18,6 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    Gemma3ForCausalLM,
 )
 from vllm import LLM, SamplingParams
 
@@ -219,14 +218,24 @@ class TextGenerator:
 
         # エンジン選択・モデル種別に応じたハンドラへディスパッチ
         handler = self._select_generation_handler(model_name, is_base_model_flag)
-        response = handler(model_name, prompt)
-
-        elapsed = time.perf_counter() - t0
-        self.execution_time_history.append(elapsed)
-        logger.info("run_elapsed_sec=%.3f", elapsed)
-        logger.info(f"Input Prompt: \n\n{prompt}")
-        logger.info(f"Generated Text: \n\n{response}")
-        return response
+        response: str | None = None
+        try:
+            response = handler(model_name, prompt)
+            return response
+        except Exception as e:
+            # GPU互換性やビルド要件に起因する失敗をヒント付きでログ
+            self._log_gpu_compatibility_hint(model_name, e)
+            logger.error("generation_failed model=%s error=%s", model_name, e)
+            raise
+        finally:
+            elapsed = time.perf_counter() - t0
+            self.execution_time_history.append(elapsed)
+            logger.info("run_elapsed_sec=%.3f", elapsed)
+            if response is not None:
+                logger.info(f"Input Prompt: \n\n{prompt}")
+                logger.info(f"Generated Text: \n\n{response}")
+            else:
+                logger.debug("No generated text due to earlier failure.")
 
     def _classify_model_name(self, model_name: str) -> str:
         """モデル名から大まかなファミリを判定する。
@@ -239,9 +248,12 @@ class TextGenerator:
         Returns
         -------
         str
-            判定結果（``"llama"``, ``"qwen"``, ``"phi"``, ``"gemma"``, ``"mistral"``, ``"unknown"``）。
+            判定結果（``"llama"``, ``"qwen"``, ``"phi"``, ``"gemma"``, ``"mistral"``, ``"deepseek"``, ``"unknown"``）。
         """
         name = (model_name or "").lower()
+        # 優先度: deepseek を先に判定（例: DeepSeek-R1-Distill-Llama-*）
+        if "deepseek" in name:
+            return "deepseek"
         if "llama" in name:
             return "llama"
         if "qwen" in name:
@@ -302,6 +314,11 @@ class TextGenerator:
                     "mistral 系で vLLM は未対応扱いとし、公式実装へフォールバックします。"
                 )
                 return self.mistral_official
+            if family == "deepseek":
+                logger.warning(
+                    "DeepSeek はリモートAPIのため vLLM を無視して API 経路を利用します。"
+                )
+                return self.run_deepseek
             logger.warning(
                 "vLLM未対応モデルのためOpenAI経路にフォールバックします: %s",
                 model_name,
@@ -313,15 +330,17 @@ class TextGenerator:
                 return self.llama_base_vllm if is_base_model else self.llama_official
             if family == "qwen":
                 return self.qwen_official
-            if family == "phi":
-                return self.phi_official
-            if family == "gemma":
-                # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
-                return self.gemma_official
-            if family == "mistral":
-                return self.mistral_official
-            logger.warning("Unexpected model name: %s", model_name)
-            return _openai_wrapper
+        if family == "phi":
+            return self.phi_official
+        if family == "gemma":
+            # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
+            return self.gemma_official
+        if family == "mistral":
+            return self.mistral_official
+        if family == "deepseek":
+            return self.run_deepseek
+        logger.warning("Unexpected model name: %s", model_name)
+        return _openai_wrapper
 
     def llama_official(self, model_name: str, prompt: str) -> str:
         """Llamaの公式実装を用いてテキスト生成を行う。
@@ -479,24 +498,18 @@ class TextGenerator:
             seq_only = dict(kwargs)
             seq_only.pop("max_model_len", None)
             try:
-                logger.warning(
-                    "Retry LLM init with max_seq_len only due to: %s", e1
-                )
+                logger.warning("Retry LLM init with max_seq_len only due to: %s", e1)
                 return LLM(**seq_only)
             except TypeError as e2:
                 both = dict(kwargs)
                 try:
-                    logger.warning(
-                        "Retry LLM init with both lens due to: %s", e2
-                    )
+                    logger.warning("Retry LLM init with both lens due to: %s", e2)
                     return LLM(**both)
                 except TypeError as e3:
                     no_len = dict(kwargs)
                     no_len.pop("max_model_len", None)
                     no_len.pop("max_seq_len", None)
-                    logger.warning(
-                        "Fallback LLM init without max len due to: %s", e3
-                    )
+                    logger.warning("Fallback LLM init without max len due to: %s", e3)
                     return LLM(**no_len)
 
     def llama_base_vllm(self, model_name: str, prompt: str) -> str:
@@ -520,7 +533,6 @@ class TextGenerator:
             temperature=self.temprature,
             repetition_penalty=self.repetition_penalty,
             max_tokens=self.max_new_tokens,
-            do_sample=self.do_sample,
             top_p=self.top_p,
             top_k=self.top_k,
         )
@@ -833,12 +845,17 @@ class TextGenerator:
             # 動的 import（パッケージ命名揺れに備え複数候補を試行）
             try:
                 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
-            except Exception as e:
+            except Exception:
                 # 旧来/別構成の可能性に備えたフォールバック
                 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
 
             try:
-                from mistral_inference import Transformer, ChatCompletionRequest, UserMessage, generate  # type: ignore
+                from mistral_inference import (
+                    Transformer,
+                    ChatCompletionRequest,
+                    UserMessage,
+                    generate,
+                )  # type: ignore
             except Exception:
                 from mistral_inference.model import Transformer  # type: ignore
                 from mistral_inference.chat import ChatCompletionRequest, UserMessage  # type: ignore
@@ -873,7 +890,9 @@ class TextGenerator:
 
             # 生成（ハイパラは本クラスの設定値を反映）
             temperature = float(self.temprature) if self.temprature is not None else 0.0
-            max_tokens = int(self.max_new_tokens) if self.max_new_tokens is not None else 256
+            max_tokens = (
+                int(self.max_new_tokens) if self.max_new_tokens is not None else 256
+            )
             eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
 
             out_tokens, _ = generate(
@@ -995,7 +1014,11 @@ class TextGenerator:
             model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+            **(
+                {"quantization_config": self.quantization_config}
+                if self.quantization_config
+                else {}
+            ),
         )
 
         messages = [
@@ -1109,6 +1132,168 @@ class TextGenerator:
 
         return response.choices[0].message.content
 
+    def run_deepseek(self, model_name: str, prompt: str) -> str:
+        """DeepSeek を Hugging Face 経由で推論する。
+
+        Parameters
+        ----------
+        model_name : str
+            利用する DeepSeek のモデル名（例: ``"deepseek-ai/DeepSeek-R1-Distill-Llama-8B"`` 等）。
+        prompt : str
+            生成の入力テキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - `inference_engine` が ``"vllm"`` の場合は vLLM 経路、
+          それ以外は transformers 公式経路を用います。
+        - トークナイザの ``apply_chat_template`` を優先的に利用し、
+          チャットフォーマットはモデル付属のテンプレートに従います。
+        """
+
+        if self.inference_engine == "vllm":
+            return self.deepseek_vllm(model_name, prompt)
+        return self.deepseek_official(model_name, prompt)
+
+    def deepseek_official(self, model_name: str, prompt: str) -> str:
+        """transformers を用いて DeepSeek のテキスト生成を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            DeepSeek 系のモデル名（Hugging Face のリポジトリパス）。
+        prompt : str
+            入力テキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+        """
+
+        self._require_hf_token()
+
+        # モデル/トークナイザ読み込み（量子化が可能なら利用）。
+        # DeepSeek-V3 は finegrained-FP8 量子化のため、GPU の SM が 8.9 未満だと失敗します。
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+            )
+        except Exception as e:
+            msg = str(e)
+            if "FP8 quantized models is only supported" in msg:
+                try:
+                    sm_major, sm_minor = torch.cuda.get_device_capability(0)
+                    sm = f"{sm_major}.{sm_minor}"
+                except Exception:
+                    sm = "unknown"
+                raise RuntimeError(
+                    "DeepSeek の FP8 量子化モデルは SM 8.9 以上が必要です。" \
+                    f"(検出GPUのSM={sm})\n" \
+                    "回避策: 1) Ada/Hopper 世代GPU(例: RTX 4090/H100)で実行, " \
+                    "2) DeepSeek-R1 系など bf16/fp16 の代替チェックポイントを使用, " \
+                    "3) vLLM + 対応環境に切替。"
+                ) from e
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # 可能ならチャットテンプレートで整形
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            text = prompt
+
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.do_sample,
+                temperature=self.temprature,
+                repetition_penalty=self.repetition_penalty,
+                top_p=self.top_p,
+                top_k=self.top_k,
+            )
+        gen = generated[0, inputs["input_ids"].shape[-1] :]
+        return tokenizer.decode(gen, skip_special_tokens=True)
+
+    def deepseek_vllm(self, model_name: str, prompt: str) -> str:
+        """vLLM を用いて DeepSeek のテキスト生成を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            DeepSeek 系のモデル名（Hugging Face のリポジトリパス）。
+        prompt : str
+            入力テキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+        """
+
+        self._require_hf_token()
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        sampling_params = SamplingParams(
+            temperature=self.temprature,
+            repetition_penalty=self.repetition_penalty,
+            max_tokens=self.max_new_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+
+        if self.llm is None:
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
+            llm_kwargs: Dict[str, Any] = dict(
+                model=model_name,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
+            )
+            if self.max_model_len is not None:
+                llm_kwargs["max_model_len"] = int(self.max_model_len)
+                llm_kwargs["max_seq_len"] = int(self.max_model_len)
+            self.llm = self._safe_create_llm(llm_kwargs)
+
+        # チャットテンプレート（可能なら）
+        try:
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            text = prompt
+
+        outputs = self.llm.generate([text], sampling_params)
+        try:
+            return outputs[0].outputs[0].text
+        except Exception:
+            return ""
+
     def _require_hf_token(self) -> None:
         """HFモデル利用時にトークンが設定されているか検証する。
 
@@ -1172,6 +1357,88 @@ class TextGenerator:
             )
             return False
         return True
+
+    def _log_gpu_compatibility_hint(self, model_name: str, exc: Exception) -> None:
+        """GPU互換性やビルド要件に関する代表的な失敗を検出し、ヒントを出力する。
+
+        Parameters
+        ----------
+        model_name : str
+            実行しようとしたモデル名。
+        exc : Exception
+            捕捉した例外。
+
+        Notes
+        -----
+        - 代表例:
+          - FP8 量子化モデル（例: DeepSeek-V3）における SM 要件未満。
+          - Triton/Inductor の `-lcuda` リンク失敗。
+          - KV キャッシュ不足（参考）。
+        - 本メソッドはログ出力のみを行い、例外は再送出元に委ねます。
+        """
+        msg = str(exc)
+        # GPU情報の収集
+        try:
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        except Exception:
+            gpu_name = "unknown"
+        try:
+            cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+            sm = f"{cc[0]}.{cc[1]}"
+        except Exception:
+            sm = "unknown"
+
+        # FP8 / SM 要件
+        if "FP8 quantized models is only supported" in msg or \
+           ("compute capability" in msg and (">=" in msg or "以上" in msg)):
+            logger.error(
+                (
+                    "GPU非対応の可能性: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: 1) Ada/Hopper 世代GPUで実行 (SM>=8.9), 2) bf16/fp16 の代替モデルに切替, 3) 量子化無しで利用可能なチェックポイントを選択"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # Triton/Inductor の CUDA リンクエラー
+        if "cannot find -lcuda" in msg or "libcuda.so" in msg or "triton" in msg:
+            logger.error(
+                (
+                    "Triton/Inductor のビルド要件未充足: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: libcuda を解決可能にする、または vLLM 初期化で enforce_eager=True（既定で有効）/ normal エンジンへ切替"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # KV キャッシュ不足のヒント（汎用）
+        if "KV cache" in msg or "max seq len" in msg or "max_model_len" in msg:
+            logger.error(
+                (
+                    "メモリ不足の可能性: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: gpu_memory_utilization を上げる、max_model_len を下げる、tensor_parallel_size を増やす"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # その他のエラーは情報ログに GPU 情報を添えて出す
+        logger.info(
+            "error_with_gpu_context model=%s gpu=%s sm=%s details=%s",
+            model_name,
+            gpu_name,
+            sm,
+            msg,
+        )
 
 
 __all__ = ["TextGenerator"]
