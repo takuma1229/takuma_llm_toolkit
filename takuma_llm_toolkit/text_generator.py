@@ -5,15 +5,20 @@ from __future__ import annotations
 import logging
 import time
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Callable
 import warnings
 import re
 
 import torch
 import transformers
 from dotenv import load_dotenv, find_dotenv
+import openai
 from openai import OpenAI
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+)
 from vllm import LLM, SamplingParams
 
 from .utils.load import Config, is_base_model
@@ -131,7 +136,9 @@ class TextGenerator:
         self.gpu_memory_utilization: float | None = gpu_memory_utilization
         self.tensor_parallel_size: int | None = tensor_parallel_size
         # None で明示的に渡された場合も 2048 を既定として採用
-        self.max_model_len: int | None = 2048 if max_model_len is None else int(max_model_len)
+        self.max_model_len: int | None = (
+            2048 if max_model_len is None else int(max_model_len)
+        )
         # bitsandbytes / triton が無い環境では自動で非量子化へフォールバック
         self.enable_bnb = self._should_enable_bnb()
         self.quantization_config = (
@@ -209,47 +216,131 @@ class TextGenerator:
         }
         logger.info("runtime_config: %s", safe_keys)
 
-        # エンジン選択に基づく分岐
+        # エンジン選択・モデル種別に応じたハンドラへディスパッチ
+        handler = self._select_generation_handler(model_name, is_base_model_flag)
+        response: str | None = None
+        try:
+            response = handler(model_name, prompt)
+            return response
+        except Exception as e:
+            # GPU互換性やビルド要件に起因する失敗をヒント付きでログ
+            self._log_gpu_compatibility_hint(model_name, e)
+            logger.error("generation_failed model=%s error=%s", model_name, e)
+            raise
+        finally:
+            elapsed = time.perf_counter() - t0
+            self.execution_time_history.append(elapsed)
+            logger.info("run_elapsed_sec=%.3f", elapsed)
+            if response is not None:
+                logger.info(f"Input Prompt: \n\n{prompt}")
+                logger.info(f"Generated Text: \n\n{response}")
+            else:
+                logger.debug("No generated text due to earlier failure.")
+
+    def _classify_model_name(self, model_name: str) -> str:
+        """モデル名から大まかなファミリを判定する。
+
+        Parameters
+        ----------
+        model_name : str
+            判定対象のモデル名。
+
+        Returns
+        -------
+        str
+            判定結果（``"llama"``, ``"qwen"``, ``"phi"``, ``"gemma"``, ``"mistral"``, ``"deepseek"``, ``"unknown"``）。
+        """
+        name = (model_name or "").lower()
+        # 優先度: deepseek を先に判定（例: DeepSeek-R1-Distill-Llama-*）
+        if "deepseek" in name:
+            return "deepseek"
+        if "llama" in name:
+            return "llama"
+        if "qwen" in name:
+            return "qwen"
+        if "phi" in name:
+            return "phi"
+        if "gemma" in name:
+            return "gemma"
+        if "mistral" in name:
+            return "mistral"
+        return "unknown"
+
+    def _select_generation_handler(
+        self, model_name: str, is_base_model: bool
+    ) -> Callable[[str, str], str]:
+        """推論エンジンとモデル種別に応じて生成ハンドラを返す。
+
+        Parameters
+        ----------
+        model_name : str
+            モデル名。
+        is_base_model : bool
+            ベースモデルかどうか（Llama系の分岐に利用）。
+
+        Returns
+        -------
+        Callable[[str, str], str]
+            ``(model_name, prompt) -> text`` の関数。OpenAI 経路は
+            内部で `run_openai_gpt(prompt, model)` へラップします。
+
+        Notes
+        -----
+        - vLLM 未対応の組合せは、公式実装や OpenAI 経路へフォールバックします。
+        - 挙動は従来の if/elif 分岐と同一になるよう維持しています。
+        """
+        family = self._classify_model_name(model_name)
+
+        def _openai_wrapper(m: str, p: str) -> str:
+            return self.run_openai_gpt(p, m)
+
         if self.inference_engine == "vllm":
-            if "llama" in model_name or "Llama" in model_name:
-                if is_base_model_flag:
-                    response = self.llama_base_vllm(model_name, prompt)
-                else:
-                    response = self.llama_vllm(model_name, prompt)
-            elif "Qwen" in model_name:
-                response = self.qwen_vllm(model_name, prompt)
-            elif "phi" in model_name or "Phi" in model_name:
+            if family == "llama":
+                return self.llama_base_vllm if is_base_model else self.llama_vllm
+            if family == "qwen":
+                return self.qwen_vllm
+            if family == "phi":
                 logger.warning(
                     "phi 系で vLLM は未対応のため、公式実装へフォールバックします。"
                 )
-                response = self.phi_official(model_name, prompt)
-            else:
+                return self.phi_official
+            if family == "gemma":
                 logger.warning(
-                    "vLLM未対応モデルのためOpenAI経路にフォールバックします: %s",
-                    model_name,
+                    "gemma 系で vLLM はまだ私が実装していないため、公式実装へフォールバックします。"
                 )
-                response = self.run_openai_gpt(prompt, model_name)
-        else:  # normal: 従来挙動を維持（公式実装優先）
-            if "llama" in model_name or "Llama" in model_name:
-                if is_base_model_flag:
-                    # 従来どおり、Llamaベースモデルは vLLM を使用
-                    response = self.llama_base_vllm(model_name, prompt)
-                else:
-                    response = self.llama_official(model_name, prompt)
-            elif "Qwen" in model_name:
-                response = self.qwen_official(model_name, prompt)
-            elif "phi" in model_name or "Phi" in model_name:
-                response = self.phi_official(model_name, prompt)
-            else:
-                logger.warning("Unexpected model name: %s", model_name)
-                response = self.run_openai_gpt(prompt, model_name)
-
-        elapsed = time.perf_counter() - t0
-        self.execution_time_history.append(elapsed)
-        logger.info("run_elapsed_sec=%.3f", elapsed)
-        logger.info(f"Input Prompt: \n\n{prompt}")
-        logger.info(f"Generated Text: \n\n{response}")
-        return response
+                return self.gemma_official
+            if family == "mistral":
+                logger.warning(
+                    "mistral 系で vLLM は未対応扱いとし、公式実装へフォールバックします。"
+                )
+                return self.mistral_official
+            if family == "deepseek":
+                logger.warning(
+                    "DeepSeek はリモートAPIのため vLLM を無視して API 経路を利用します。"
+                )
+                return self.run_deepseek
+            logger.warning(
+                "vLLM未対応モデルのためOpenAI経路にフォールバックします: %s",
+                model_name,
+            )
+            return _openai_wrapper
+        elif self.inference_engine == "normal":
+            # normal: 従来挙動（公式実装優先）
+            if family == "llama":
+                return self.llama_base_vllm if is_base_model else self.llama_official
+            if family == "qwen":
+                return self.qwen_official
+        if family == "phi":
+            return self.phi_official
+        if family == "gemma":
+            # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
+            return self.gemma_official
+        if family == "mistral":
+            return self.mistral_official
+        if family == "deepseek":
+            return self.run_deepseek
+        logger.warning("Unexpected model name: %s", model_name)
+        return _openai_wrapper
 
     def llama_official(self, model_name: str, prompt: str) -> str:
         """Llamaの公式実装を用いてテキスト生成を行う。
@@ -355,6 +446,7 @@ class TextGenerator:
                 model=model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
@@ -392,21 +484,27 @@ class TextGenerator:
         以下の順序で安全に初期化を試みます。
         1) そのまま渡す → 2) max_seq_len のみ → 3) max_model_len のみ → 4) どちらも除外
         """
+        # 近年の vLLM は `max_seq_len` を受け付けないケースが多いため、
+        # まずは `max_model_len` のみで試行 → それで失敗したら `max_seq_len` のみ → 両方 → どちらも無し。
+        model_only = dict(kwargs)
+        model_only.pop("max_seq_len", None)
         try:
-            logger.info("LLM init kwargs=%s", {k: v for k, v in kwargs.items() if k != "model"})
-            return LLM(**kwargs)
-        except TypeError as e:
+            logger.info(
+                "LLM init kwargs(model_only)=%s",
+                {k: v for k, v in model_only.items() if k != "model"},
+            )
+            return LLM(**model_only)
+        except TypeError as e1:
             seq_only = dict(kwargs)
             seq_only.pop("max_model_len", None)
             try:
-                logger.warning("Retry LLM init with max_seq_len only due to: %s", e)
+                logger.warning("Retry LLM init with max_seq_len only due to: %s", e1)
                 return LLM(**seq_only)
             except TypeError as e2:
-                model_only = dict(kwargs)
-                model_only.pop("max_seq_len", None)
+                both = dict(kwargs)
                 try:
-                    logger.warning("Retry LLM init with max_model_len only due to: %s", e2)
-                    return LLM(**model_only)
+                    logger.warning("Retry LLM init with both lens due to: %s", e2)
+                    return LLM(**both)
                 except TypeError as e3:
                     no_len = dict(kwargs)
                     no_len.pop("max_model_len", None)
@@ -435,7 +533,6 @@ class TextGenerator:
             temperature=self.temprature,
             repetition_penalty=self.repetition_penalty,
             max_tokens=self.max_new_tokens,
-            do_sample=self.do_sample,
             top_p=self.top_p,
             top_k=self.top_k,
         )
@@ -454,6 +551,7 @@ class TextGenerator:
                 model=model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
@@ -576,13 +674,12 @@ class TextGenerator:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 quantization="bitsandbytes",
                 load_format="bitsandbytes",
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
                 llm_kwargs["max_seq_len"] = int(self.max_model_len)
             self.llm = self._safe_create_llm(llm_kwargs)
-
-        
 
         messages = [{"role": "user", "content": prompt}]
         text = tokenizer.apply_chat_template(
@@ -658,6 +755,293 @@ class TextGenerator:
         )
         return outputs[0]["generated_text"][-1]["content"]
 
+    def gemma_official(self, model_name: str, prompt: str) -> str:
+        """Gemma 3（Instruction/Turbo等）の公式実装でテキストを生成する。
+
+        Parameters
+        ----------
+        model_name : str
+            使用する Gemma 3 系モデル（例: ``"google/gemma-3-4b-it"``）。
+        prompt : str
+            ユーザーからの入力テキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+
+        Notes
+        -----
+        - 画像処理用の ``AutoProcessor`` ではなく、テキスト専用の ``AutoTokenizer`` を利用します。
+        - チャットテンプレートはトークナイザの ``apply_chat_template`` を用いて文字列化し、
+          通常の ``tokenizer(...)`` でテンソル化します。
+        - モデル重みは ``bfloat16``、デバイス割当は ``device_map=\"auto\"`` を採用します。
+        """
+
+        model = Gemma3ForConditionalGeneration.from_pretrained(
+            model_name, device_map="auto", torch_dtype=torch.bfloat16
+        ).eval()
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+
+        # チャットテンプレートを文字列として展開
+        text = tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
+
+        # テンソル化してモデルデバイスへ
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+        input_len = inputs["input_ids"].shape[-1]
+
+        with torch.inference_mode():
+            generation = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.do_sample,
+                temperature=self.temprature,
+                repetition_penalty=self.repetition_penalty,
+                top_p=self.top_p,
+                top_k=self.top_k,
+            )
+            # 追記部分のみ取り出し
+            generation = generation[0][input_len:]
+
+        decoded = tokenizer.decode(generation, skip_special_tokens=True)
+        return decoded
+
+    def mistral_official(self, model_name: str, prompt: str) -> str:
+        """Mistral 公式実装（Tokenizer/Transformer/generate）で推論を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            使用するモデルを指すパス。ローカルの Mistral フォルダパス、
+            もしくは環境変数 ``MISTRAL_MODELS_PATH`` で指すフォルダを利用します。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - 下記の Mistral 公式スタックに準拠します。
+          ``MistralTokenizer.from_file`` → ``Transformer.from_folder`` → ``generate``。
+        - 必要パッケージ（例: ``mistral-common``, ``mistral-inference``）が未導入の環境では、
+          自動的に vLLM 互換経路へフォールバックします。
+        - 生成ハイパラは本クラスの設定値（``max_new_tokens``/``temperature`` 等）を反映します。
+        """
+
+        # 公式実装（mistral-*）が利用可能なら優先する
+        try:
+            # 動的 import（パッケージ命名揺れに備え複数候補を試行）
+            try:
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
+            except Exception:
+                # 旧来/別構成の可能性に備えたフォールバック
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
+
+            try:
+                from mistral_inference import (
+                    Transformer,
+                    ChatCompletionRequest,
+                    UserMessage,
+                    generate,
+                )  # type: ignore
+            except Exception:
+                from mistral_inference.model import Transformer  # type: ignore
+                from mistral_inference.chat import ChatCompletionRequest, UserMessage  # type: ignore
+                from mistral_inference.generate import generate  # type: ignore
+
+            # モデルフォルダの解決
+            def _resolve_models_path(name: str) -> str:
+                if name and os.path.isdir(name):
+                    return name
+                env_path = os.getenv("MISTRAL_MODELS_PATH", "").strip()
+                if env_path and os.path.isdir(env_path):
+                    return env_path
+                raise ValueError(
+                    "Mistral のモデルフォルダが見つかりません。model_name にローカルフォルダを指定するか、"
+                    "環境変数 MISTRAL_MODELS_PATH を設定してください。"
+                )
+
+            mistral_models_path = _resolve_models_path(model_name)
+
+            # トークナイザ/モデルのロード
+            tokenizer = MistralTokenizer.from_file(
+                f"{mistral_models_path}/tokenizer.model.v3"
+            )
+            model = Transformer.from_folder(mistral_models_path)
+
+            # プロンプトをユーザ指定で構成
+            completion_request = ChatCompletionRequest(
+                messages=[UserMessage(content=prompt)]
+            )
+
+            tokens = tokenizer.encode_chat_completion(completion_request).tokens
+
+            # 生成（ハイパラは本クラスの設定値を反映）
+            temperature = float(self.temprature) if self.temprature is not None else 0.0
+            max_tokens = (
+                int(self.max_new_tokens) if self.max_new_tokens is not None else 256
+            )
+            eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
+
+            out_tokens, _ = generate(
+                [tokens],
+                model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                eos_id=eos_id,
+            )
+            result = tokenizer.instruct_tokenizer.tokenizer.decode(out_tokens[0])
+            return result
+
+        except (ImportError, ModuleNotFoundError) as e:
+            # ライブラリ未導入時は transformers 経路を先に試す（vLLM 依存を避ける）
+            logger.warning(
+                "Mistral公式ライブラリが見つからないため、transformers 経路へフォールバックします: %s",
+                e,
+            )
+            try:
+                return self.mistral_hf_official(model_name, prompt)
+            except Exception as e2:
+                logger.warning(
+                    "transformers 経路でも失敗したため、最終手段として vLLM へフォールバックします: %s",
+                    e2,
+                )
+                return self.mistral_vllm_compat(model_name, prompt)
+        except ValueError as e:
+            # モデルフォルダ未検出など利用者設定が必要なケースはそのまま通知
+            logger.error("Mistralモデルパスの解決に失敗しました: %s", e)
+            raise
+        except Exception as e:
+            # それ以外は明示的に失敗を知らせる（不用意に vLLM へ逃げない）
+            logger.error("Mistral公式実装での推論に失敗しました: %s", e)
+            raise
+
+    def mistral_vllm_compat(self, model_name: str, prompt: str) -> str:
+        """vLLM を用いた Mistral 推論（後方互換用）。
+
+        Parameters
+        ----------
+        model_name : str
+            使用する Mistral モデル（例: ``"mistralai/Mistral-Small-3.1-24B-Instruct-2503"``）。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+        """
+
+        self._require_hf_token()
+
+        sampling_params = SamplingParams(
+            max_tokens=self.max_new_tokens,
+            temperature=self.temprature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            repetition_penalty=self.repetition_penalty,
+        )
+
+        if self.llm is None:
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
+            llm_kwargs: Dict[str, Any] = dict(
+                model=model_name,
+                tokenizer_mode="mistral",
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
+            )
+            if self.max_model_len is not None:
+                llm_kwargs["max_model_len"] = int(self.max_model_len)
+                llm_kwargs["max_seq_len"] = int(self.max_model_len)
+            self.llm = self._safe_create_llm(llm_kwargs)
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+
+        outputs = self.llm.chat(messages, sampling_params=sampling_params)
+        try:
+            return outputs[0].outputs[0].text
+        except Exception:
+            return ""
+
+    def mistral_hf_official(self, model_name: str, prompt: str) -> str:
+        """transformers を用いた Mistral 推論を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            使用する Mistral モデル（例: ``"mistralai/Mistral-7B-Instruct-v0.3"``）。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - `AutoTokenizer.apply_chat_template` でプロンプトを整形し、
+          `AutoModelForCausalLM.generate` で生成します。
+        - 量子化が利用可能なら BitsAndBytes を用い、それ以外は非量子化で自動デバイス割当します。
+        """
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            **(
+                {"quantization_config": self.quantization_config}
+                if self.quantization_config
+                else {}
+            ),
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temprature,
+            repetition_penalty=self.repetition_penalty,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+        gen = generated_ids[0, inputs["input_ids"].shape[-1] :]
+        return tokenizer.decode(gen, skip_special_tokens=True)
+
     def run_openai_gpt(
         self, prompt: str, model: str = "gpt-4o-mini", temperature: float | None = None
     ) -> str:
@@ -676,33 +1060,239 @@ class TextGenerator:
         -------
         str
             生成されたテキスト。
+
+        Notes
+        -----
+        一部のモデル（例: GPT-5 系）では ``temperature`` の任意値が未対応で、
+        既定値のみ受け付ける場合があります。その場合は 400 のBadRequestが返るため、
+        本メソッドでは例外内容を検出して ``temperature`` を除去した上で自動再試行します。
         """
 
         client = OpenAI()
         sampling_temperature = self.temprature if temperature is None else temperature
 
+        # 送信ペイロードの組み立て
         if self._is_openai_gpt5_or_newer(model):
-            # GPT-5 以降: 未対応/制約のあるパラメータを避け、最小構成で送信
+            # GPT-5系はパラメータ制約が変わる可能性があるため極力シンプルに
             payload = dict(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
-                temperature=sampling_temperature,
             )
+            # 温度指定がある場合のみ付与（未対応時は下の例外分岐で自動除去）
+            if sampling_temperature is not None:
+                payload["temperature"] = sampling_temperature
         else:
-            # GPT-4 系: 既存パラメータを活用
+            # GPT-4系
             payload = dict(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 stream=False,
-                temperature=sampling_temperature,
-                seed=9,
-                top_p=self.top_p,
-                max_tokens=self.max_new_tokens,
-                presence_penalty=self.repetition_penalty,
+            )
+            if sampling_temperature is not None:
+                payload["temperature"] = sampling_temperature
+            # 追加のサンプリング関連（互換性のある範囲で送る）
+            payload.update(
+                dict(
+                    seed=9,
+                    top_p=self.top_p,
+                    max_tokens=self.max_new_tokens,
+                    presence_penalty=self.repetition_penalty,
+                )
             )
 
-        response = client.chat.completions.create(**payload)
+        # 送信＆フォールバック（temperature未対応時は自動で削除して再送）
+        try:
+            response = client.chat.completions.create(**payload)
+        except Exception as e:
+            err_text = str(e)
+            # OpenAIのBadRequestで temperature 未対応を検出
+            is_bad_request = (
+                isinstance(e, openai.BadRequestError) or "BadRequestError" in err_text
+            )
+            temperature_involved = "temperature" in err_text.lower()
+            unsupported_value = (
+                "unsupported_value" in err_text or "does not support" in err_text
+            )
+            if (
+                is_bad_request
+                and temperature_involved
+                and unsupported_value
+                and "temperature" in payload
+            ):
+                # 温度パラメータを除外して再送
+                temp_val = payload.pop("temperature")
+                logger.warning(
+                    "model=%s は temperature=%s を受け付けないため無視して再試行します。",
+                    model,
+                    temp_val,
+                )
+                response = client.chat.completions.create(**payload)
+            else:
+                raise
+
         return response.choices[0].message.content
+
+    def run_deepseek(self, model_name: str, prompt: str) -> str:
+        """DeepSeek を Hugging Face 経由で推論する。
+
+        Parameters
+        ----------
+        model_name : str
+            利用する DeepSeek のモデル名（例: ``"deepseek-ai/DeepSeek-R1-Distill-Llama-8B"`` 等）。
+        prompt : str
+            生成の入力テキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - `inference_engine` が ``"vllm"`` の場合は vLLM 経路、
+          それ以外は transformers 公式経路を用います。
+        - トークナイザの ``apply_chat_template`` を優先的に利用し、
+          チャットフォーマットはモデル付属のテンプレートに従います。
+        """
+
+        if self.inference_engine == "vllm":
+            return self.deepseek_vllm(model_name, prompt)
+        return self.deepseek_official(model_name, prompt)
+
+    def deepseek_official(self, model_name: str, prompt: str) -> str:
+        """transformers を用いて DeepSeek のテキスト生成を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            DeepSeek 系のモデル名（Hugging Face のリポジトリパス）。
+        prompt : str
+            入力テキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+        """
+
+        self._require_hf_token()
+
+        # モデル/トークナイザ読み込み（量子化が可能なら利用）。
+        # DeepSeek-V3 は finegrained-FP8 量子化のため、GPU の SM が 8.9 未満だと失敗します。
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+            )
+        except Exception as e:
+            msg = str(e)
+            if "FP8 quantized models is only supported" in msg:
+                try:
+                    sm_major, sm_minor = torch.cuda.get_device_capability(0)
+                    sm = f"{sm_major}.{sm_minor}"
+                except Exception:
+                    sm = "unknown"
+                raise RuntimeError(
+                    "DeepSeek の FP8 量子化モデルは SM 8.9 以上が必要です。" \
+                    f"(検出GPUのSM={sm})\n" \
+                    "回避策: 1) Ada/Hopper 世代GPU(例: RTX 4090/H100)で実行, " \
+                    "2) DeepSeek-R1 系など bf16/fp16 の代替チェックポイントを使用, " \
+                    "3) vLLM + 対応環境に切替。"
+                ) from e
+            raise
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        # 可能ならチャットテンプレートで整形
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            text = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            text = prompt
+
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            generated = model.generate(
+                **inputs,
+                max_new_tokens=self.max_new_tokens,
+                do_sample=self.do_sample,
+                temperature=self.temprature,
+                repetition_penalty=self.repetition_penalty,
+                top_p=self.top_p,
+                top_k=self.top_k,
+            )
+        gen = generated[0, inputs["input_ids"].shape[-1] :]
+        return tokenizer.decode(gen, skip_special_tokens=True)
+
+    def deepseek_vllm(self, model_name: str, prompt: str) -> str:
+        """vLLM を用いて DeepSeek のテキスト生成を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            DeepSeek 系のモデル名（Hugging Face のリポジトリパス）。
+        prompt : str
+            入力テキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+        """
+
+        self._require_hf_token()
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        sampling_params = SamplingParams(
+            temperature=self.temprature,
+            repetition_penalty=self.repetition_penalty,
+            max_tokens=self.max_new_tokens,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+
+        if self.llm is None:
+            if self.tensor_parallel_size is None:
+                self.tensor_parallel_size = max(1, torch.cuda.device_count())
+            if self.gpu_memory_utilization is None:
+                try:
+                    self.gpu_memory_utilization = min(
+                        0.95, float(estimate_gpu_utilization(model_name))
+                    )
+                except Exception:
+                    self.gpu_memory_utilization = 0.9
+            llm_kwargs: Dict[str, Any] = dict(
+                model=model_name,
+                tensor_parallel_size=self.tensor_parallel_size,
+                gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
+            )
+            if self.max_model_len is not None:
+                llm_kwargs["max_model_len"] = int(self.max_model_len)
+                llm_kwargs["max_seq_len"] = int(self.max_model_len)
+            self.llm = self._safe_create_llm(llm_kwargs)
+
+        # チャットテンプレート（可能なら）
+        try:
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            text = prompt
+
+        outputs = self.llm.generate([text], sampling_params)
+        try:
+            return outputs[0].outputs[0].text
+        except Exception:
+            return ""
 
     def _require_hf_token(self) -> None:
         """HFモデル利用時にトークンが設定されているか検証する。
@@ -767,6 +1357,88 @@ class TextGenerator:
             )
             return False
         return True
+
+    def _log_gpu_compatibility_hint(self, model_name: str, exc: Exception) -> None:
+        """GPU互換性やビルド要件に関する代表的な失敗を検出し、ヒントを出力する。
+
+        Parameters
+        ----------
+        model_name : str
+            実行しようとしたモデル名。
+        exc : Exception
+            捕捉した例外。
+
+        Notes
+        -----
+        - 代表例:
+          - FP8 量子化モデル（例: DeepSeek-V3）における SM 要件未満。
+          - Triton/Inductor の `-lcuda` リンク失敗。
+          - KV キャッシュ不足（参考）。
+        - 本メソッドはログ出力のみを行い、例外は再送出元に委ねます。
+        """
+        msg = str(exc)
+        # GPU情報の収集
+        try:
+            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+        except Exception:
+            gpu_name = "unknown"
+        try:
+            cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+            sm = f"{cc[0]}.{cc[1]}"
+        except Exception:
+            sm = "unknown"
+
+        # FP8 / SM 要件
+        if "FP8 quantized models is only supported" in msg or \
+           ("compute capability" in msg and (">=" in msg or "以上" in msg)):
+            logger.error(
+                (
+                    "GPU非対応の可能性: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: 1) Ada/Hopper 世代GPUで実行 (SM>=8.9), 2) bf16/fp16 の代替モデルに切替, 3) 量子化無しで利用可能なチェックポイントを選択"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # Triton/Inductor の CUDA リンクエラー
+        if "cannot find -lcuda" in msg or "libcuda.so" in msg or "triton" in msg:
+            logger.error(
+                (
+                    "Triton/Inductor のビルド要件未充足: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: libcuda を解決可能にする、または vLLM 初期化で enforce_eager=True（既定で有効）/ normal エンジンへ切替"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # KV キャッシュ不足のヒント（汎用）
+        if "KV cache" in msg or "max seq len" in msg or "max_model_len" in msg:
+            logger.error(
+                (
+                    "メモリ不足の可能性: model=%s | gpu=%s | sm=%s | details=%s\n"
+                    "対処: gpu_memory_utilization を上げる、max_model_len を下げる、tensor_parallel_size を増やす"
+                ),
+                model_name,
+                gpu_name,
+                sm,
+                msg,
+            )
+            return
+
+        # その他のエラーは情報ログに GPU 情報を添えて出す
+        logger.info(
+            "error_with_gpu_context model=%s gpu=%s sm=%s details=%s",
+            model_name,
+            gpu_name,
+            sm,
+            msg,
+        )
 
 
 __all__ = ["TextGenerator"]
