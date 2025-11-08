@@ -427,6 +427,7 @@ class TextGenerator:
                 model=model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
@@ -464,30 +465,38 @@ class TextGenerator:
         以下の順序で安全に初期化を試みます。
         1) そのまま渡す → 2) max_seq_len のみ → 3) max_model_len のみ → 4) どちらも除外
         """
+        # 近年の vLLM は `max_seq_len` を受け付けないケースが多いため、
+        # まずは `max_model_len` のみで試行 → それで失敗したら `max_seq_len` のみ → 両方 → どちらも無し。
+        model_only = dict(kwargs)
+        model_only.pop("max_seq_len", None)
         try:
             logger.info(
-                "LLM init kwargs=%s", {k: v for k, v in kwargs.items() if k != "model"}
+                "LLM init kwargs(model_only)=%s",
+                {k: v for k, v in model_only.items() if k != "model"},
             )
-            return LLM(**kwargs)
-        except TypeError as e:
+            return LLM(**model_only)
+        except TypeError as e1:
             seq_only = dict(kwargs)
             seq_only.pop("max_model_len", None)
             try:
-                logger.warning("Retry LLM init with max_seq_len only due to: %s", e)
+                logger.warning(
+                    "Retry LLM init with max_seq_len only due to: %s", e1
+                )
                 return LLM(**seq_only)
             except TypeError as e2:
-                model_only = dict(kwargs)
-                model_only.pop("max_seq_len", None)
+                both = dict(kwargs)
                 try:
                     logger.warning(
-                        "Retry LLM init with max_model_len only due to: %s", e2
+                        "Retry LLM init with both lens due to: %s", e2
                     )
-                    return LLM(**model_only)
+                    return LLM(**both)
                 except TypeError as e3:
                     no_len = dict(kwargs)
                     no_len.pop("max_model_len", None)
                     no_len.pop("max_seq_len", None)
-                    logger.warning("Fallback LLM init without max len due to: %s", e3)
+                    logger.warning(
+                        "Fallback LLM init without max len due to: %s", e3
+                    )
                     return LLM(**no_len)
 
     def llama_base_vllm(self, model_name: str, prompt: str) -> str:
@@ -530,6 +539,7 @@ class TextGenerator:
                 model=model_name,
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
@@ -652,6 +662,7 @@ class TextGenerator:
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 quantization="bitsandbytes",
                 load_format="bitsandbytes",
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
@@ -755,30 +766,15 @@ class TextGenerator:
         - モデル重みは ``bfloat16``、デバイス割当は ``device_map=\"auto\"`` を採用します。
         """
 
-        model = Gemma3ForCausalLM.from_pretrained(
+        model = Gemma3ForConditionalGeneration.from_pretrained(
             model_name, device_map="auto", torch_dtype=torch.bfloat16
-        )
+        ).eval()
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         messages = [
-            [
-                {
-                    "role": "system",
-                    "content": [
-                        {"type": "text", "text": "You are a helpful assistant."},
-                    ],
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": prompt,
-                        },
-                    ],
-                },
-            ],
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
         ]
 
         # チャットテンプレートを文字列として展開
@@ -808,7 +804,113 @@ class TextGenerator:
         return decoded
 
     def mistral_official(self, model_name: str, prompt: str) -> str:
-        """Mistral の「公式実装」（vLLM の ``llm.chat``）で推論する。
+        """Mistral 公式実装（Tokenizer/Transformer/generate）で推論を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            使用するモデルを指すパス。ローカルの Mistral フォルダパス、
+            もしくは環境変数 ``MISTRAL_MODELS_PATH`` で指すフォルダを利用します。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - 下記の Mistral 公式スタックに準拠します。
+          ``MistralTokenizer.from_file`` → ``Transformer.from_folder`` → ``generate``。
+        - 必要パッケージ（例: ``mistral-common``, ``mistral-inference``）が未導入の環境では、
+          自動的に vLLM 互換経路へフォールバックします。
+        - 生成ハイパラは本クラスの設定値（``max_new_tokens``/``temperature`` 等）を反映します。
+        """
+
+        # 公式実装（mistral-*）が利用可能なら優先する
+        try:
+            # 動的 import（パッケージ命名揺れに備え複数候補を試行）
+            try:
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
+            except Exception as e:
+                # 旧来/別構成の可能性に備えたフォールバック
+                from mistral_common.tokens.tokenizers.mistral import MistralTokenizer  # type: ignore
+
+            try:
+                from mistral_inference import Transformer, ChatCompletionRequest, UserMessage, generate  # type: ignore
+            except Exception:
+                from mistral_inference.model import Transformer  # type: ignore
+                from mistral_inference.chat import ChatCompletionRequest, UserMessage  # type: ignore
+                from mistral_inference.generate import generate  # type: ignore
+
+            # モデルフォルダの解決
+            def _resolve_models_path(name: str) -> str:
+                if name and os.path.isdir(name):
+                    return name
+                env_path = os.getenv("MISTRAL_MODELS_PATH", "").strip()
+                if env_path and os.path.isdir(env_path):
+                    return env_path
+                raise ValueError(
+                    "Mistral のモデルフォルダが見つかりません。model_name にローカルフォルダを指定するか、"
+                    "環境変数 MISTRAL_MODELS_PATH を設定してください。"
+                )
+
+            mistral_models_path = _resolve_models_path(model_name)
+
+            # トークナイザ/モデルのロード
+            tokenizer = MistralTokenizer.from_file(
+                f"{mistral_models_path}/tokenizer.model.v3"
+            )
+            model = Transformer.from_folder(mistral_models_path)
+
+            # プロンプトをユーザ指定で構成
+            completion_request = ChatCompletionRequest(
+                messages=[UserMessage(content=prompt)]
+            )
+
+            tokens = tokenizer.encode_chat_completion(completion_request).tokens
+
+            # 生成（ハイパラは本クラスの設定値を反映）
+            temperature = float(self.temprature) if self.temprature is not None else 0.0
+            max_tokens = int(self.max_new_tokens) if self.max_new_tokens is not None else 256
+            eos_id = tokenizer.instruct_tokenizer.tokenizer.eos_id
+
+            out_tokens, _ = generate(
+                [tokens],
+                model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                eos_id=eos_id,
+            )
+            result = tokenizer.instruct_tokenizer.tokenizer.decode(out_tokens[0])
+            return result
+
+        except (ImportError, ModuleNotFoundError) as e:
+            # ライブラリ未導入時は transformers 経路を先に試す（vLLM 依存を避ける）
+            logger.warning(
+                "Mistral公式ライブラリが見つからないため、transformers 経路へフォールバックします: %s",
+                e,
+            )
+            try:
+                return self.mistral_hf_official(model_name, prompt)
+            except Exception as e2:
+                logger.warning(
+                    "transformers 経路でも失敗したため、最終手段として vLLM へフォールバックします: %s",
+                    e2,
+                )
+                return self.mistral_vllm_compat(model_name, prompt)
+        except ValueError as e:
+            # モデルフォルダ未検出など利用者設定が必要なケースはそのまま通知
+            logger.error("Mistralモデルパスの解決に失敗しました: %s", e)
+            raise
+        except Exception as e:
+            # それ以外は明示的に失敗を知らせる（不用意に vLLM へ逃げない）
+            logger.error("Mistral公式実装での推論に失敗しました: %s", e)
+            raise
+
+    def mistral_vllm_compat(self, model_name: str, prompt: str) -> str:
+        """vLLM を用いた Mistral 推論（後方互換用）。
 
         Parameters
         ----------
@@ -821,18 +923,10 @@ class TextGenerator:
         -------
         str
             生成されたテキスト。
-
-        Notes
-        -----
-        - vLLM を用い、``tokenizer_mode="mistral"`` を指定して初期化します。
-        - GPU メモリ・並列数はクラス設定（自動推定を含む）を用います。
-        - `SamplingParams` には ``temperature``, ``top_p``, ``top_k``, ``repetition_penalty``,
-          ``max_tokens`` を反映します。
         """
 
         self._require_hf_token()
 
-        # Sampling 設定
         sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
             temperature=self.temprature,
@@ -841,7 +935,6 @@ class TextGenerator:
             repetition_penalty=self.repetition_penalty,
         )
 
-        # LLM 初期化（必要に応じて）
         if self.llm is None:
             if self.tensor_parallel_size is None:
                 self.tensor_parallel_size = max(1, torch.cuda.device_count())
@@ -857,13 +950,13 @@ class TextGenerator:
                 tokenizer_mode="mistral",
                 tensor_parallel_size=self.tensor_parallel_size,
                 gpu_memory_utilization=self.gpu_memory_utilization,
+                enforce_eager=True,
             )
             if self.max_model_len is not None:
                 llm_kwargs["max_model_len"] = int(self.max_model_len)
                 llm_kwargs["max_seq_len"] = int(self.max_model_len)
             self.llm = self._safe_create_llm(llm_kwargs)
 
-        # メッセージ（system は簡易既定。必要なら拡張可能）
         messages = [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": prompt},
@@ -874,6 +967,57 @@ class TextGenerator:
             return outputs[0].outputs[0].text
         except Exception:
             return ""
+
+    def mistral_hf_official(self, model_name: str, prompt: str) -> str:
+        """transformers を用いた Mistral 推論を行う。
+
+        Parameters
+        ----------
+        model_name : str
+            使用する Mistral モデル（例: ``"mistralai/Mistral-7B-Instruct-v0.3"``）。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成されたテキスト。
+
+        Notes
+        -----
+        - `AutoTokenizer.apply_chat_template` でプロンプトを整形し、
+          `AutoModelForCausalLM.generate` で生成します。
+        - 量子化が利用可能なら BitsAndBytes を用い、それ以外は非量子化で自動デバイス割当します。
+        """
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+        )
+
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temprature,
+            repetition_penalty=self.repetition_penalty,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+        gen = generated_ids[0, inputs["input_ids"].shape[-1] :]
+        return tokenizer.decode(gen, skip_special_tokens=True)
 
     def run_openai_gpt(
         self, prompt: str, model: str = "gpt-4o-mini", temperature: float | None = None
