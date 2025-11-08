@@ -18,6 +18,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
+    Gemma3ForCausalLM,
 )
 from vllm import LLM, SamplingParams
 
@@ -778,29 +779,43 @@ class TextGenerator:
         - モデル重みは ``bfloat16``、デバイス割当は ``device_map=\"auto\"`` を採用します。
         """
 
-        model = Gemma3ForConditionalGeneration.from_pretrained(
+        model = Gemma3ForCausalLM.from_pretrained(
             model_name, device_map="auto", torch_dtype=torch.bfloat16
-        ).eval()
+        )
 
         tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         messages = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "You are a helpful assistant."},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
         ]
 
-        # チャットテンプレートを文字列として展開
-        text = tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True, tokenize=False
+        inputs = (
+            tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=True,
+                return_dict=True,
+                return_tensors="pt",
+            )
+            .to(model.device)
+            .to(torch.bfloat16)
         )
 
-        # テンソル化してモデルデバイスへ
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-        input_len = inputs["input_ids"].shape[-1]
-
         with torch.inference_mode():
-            generation = model.generate(
+            outputs = model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=self.do_sample,
@@ -809,11 +824,9 @@ class TextGenerator:
                 top_p=self.top_p,
                 top_k=self.top_k,
             )
-            # 追記部分のみ取り出し
-            generation = generation[0][input_len:]
 
-        decoded = tokenizer.decode(generation, skip_special_tokens=True)
-        return decoded
+        outputs = tokenizer.batch_decode(outputs)
+        return outputs[0].split("<start_of_turn>model")[-1]
 
     def mistral_official(self, model_name: str, prompt: str) -> str:
         """Mistral 公式実装（Tokenizer/Transformer/generate）で推論を行う。
@@ -1184,7 +1197,11 @@ class TextGenerator:
                 model_name,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
-                **({"quantization_config": self.quantization_config} if self.quantization_config else {}),
+                **(
+                    {"quantization_config": self.quantization_config}
+                    if self.quantization_config
+                    else {}
+                ),
             )
         except Exception as e:
             msg = str(e)
@@ -1195,10 +1212,10 @@ class TextGenerator:
                 except Exception:
                     sm = "unknown"
                 raise RuntimeError(
-                    "DeepSeek の FP8 量子化モデルは SM 8.9 以上が必要です。" \
-                    f"(検出GPUのSM={sm})\n" \
-                    "回避策: 1) Ada/Hopper 世代GPU(例: RTX 4090/H100)で実行, " \
-                    "2) DeepSeek-R1 系など bf16/fp16 の代替チェックポイントを使用, " \
+                    "DeepSeek の FP8 量子化モデルは SM 8.9 以上が必要です。"
+                    f"(検出GPUのSM={sm})\n"
+                    "回避策: 1) Ada/Hopper 世代GPU(例: RTX 4090/H100)で実行, "
+                    "2) DeepSeek-R1 系など bf16/fp16 の代替チェックポイントを使用, "
                     "3) vLLM + 対応環境に切替。"
                 ) from e
             raise
@@ -1379,18 +1396,25 @@ class TextGenerator:
         msg = str(exc)
         # GPU情報の収集
         try:
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+            gpu_name = (
+                torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+            )
         except Exception:
             gpu_name = "unknown"
         try:
-            cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0, 0)
+            cc = (
+                torch.cuda.get_device_capability(0)
+                if torch.cuda.is_available()
+                else (0, 0)
+            )
             sm = f"{cc[0]}.{cc[1]}"
         except Exception:
             sm = "unknown"
 
         # FP8 / SM 要件
-        if "FP8 quantized models is only supported" in msg or \
-           ("compute capability" in msg and (">=" in msg or "以上" in msg)):
+        if "FP8 quantized models is only supported" in msg or (
+            "compute capability" in msg and (">=" in msg or "以上" in msg)
+        ):
             logger.error(
                 (
                     "GPU非対応の可能性: model=%s | gpu=%s | sm=%s | details=%s\n"
