@@ -10,6 +10,7 @@ dependencies = [
     "transformers>=4.40",
     "vllm>=0.4.0",
     "openai>=1.30.0",
+    "accelerate>=1.11.0",
 ]
 
 # メタデータ（必要に応じて編集してください）

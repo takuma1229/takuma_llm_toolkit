@@ -6,7 +6,6 @@ Notes
 """
 
 DEFAULT_MODEL = "meta-llama/Meta-Llama-3-8B-Instruct"
-DEFAULT_PROMPT = "日本語で3行自己紹介して"
+DEFAULT_PROMPT = "分析哲学について教えて。"
 
 __all__ = ["DEFAULT_MODEL", "DEFAULT_PROMPT"]
-
