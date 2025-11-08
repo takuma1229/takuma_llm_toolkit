@@ -1,6 +1,6 @@
 [project]
 name = "takuma-llm-toolkit"
-version = "0.1.5"
+version = "0.1.6"
 description = "LLM推論のためのユーティリティ集"
 readme = "README.md"
 requires-python = ">=3.11"
