@@ -859,8 +859,41 @@ class TextGenerator:
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ]
+        tokenizer_mode = "mistral"
+        if model_name in {
+            "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
+        }:
+            logger.info(
+                "model=%s は vLLM + tokenizer_mode='mistral' と相性が悪いため、"
+                "Hugging Face 互換の tokenizer_mode='auto' で初期化します。",
+                model_name,
+            )
+            tokenizer_mode = "auto"
+
+        if self.tensor_parallel_size is None:
+            self.tensor_parallel_size = max(1, torch.cuda.device_count())
+        if self.gpu_memory_utilization is None:
+            try:
+                self.gpu_memory_utilization = min(
+                    0.95, float(estimate_gpu_utilization(model_name))
+                )
+            except Exception:
+                self.gpu_memory_utilization = 0.9
+            if model_name == "mistralai/Mistral-Small-3.1-24B-Instruct-2503":
+                self.gpu_memory_utilization = min(self.gpu_memory_utilization, 0.8)
+
+        llm_kwargs: Dict[str, Any] = dict(
+            model=model_name,
+            tokenizer_mode=tokenizer_mode,
+            tensor_parallel_size=self.tensor_parallel_size,
+            gpu_memory_utilization=self.gpu_memory_utilization,
+        )
+        if self.max_model_len is not None:
+            llm_kwargs["max_model_len"] = int(self.max_model_len)
+            llm_kwargs["max_seq_len"] = int(self.max_model_len)
+
         # note that running this model on GPU requires over 60 GB of GPU RAM
-        llm = LLM(model=model_name, tokenizer_mode="mistral")
+        llm = self._safe_create_llm(llm_kwargs)
 
         sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
