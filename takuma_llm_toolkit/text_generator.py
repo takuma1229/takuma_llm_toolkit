@@ -740,7 +740,7 @@ class TextGenerator:
         messages = [
             {
                 "role": "system",
-                "content": "You are a medieval knight and must provide explanations to modern people.",
+                "content": "You are a helpful assistant.",
             },
             {"role": "user", "content": prompt},
         ]
