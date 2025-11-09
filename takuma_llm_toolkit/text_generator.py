@@ -328,7 +328,7 @@ class TextGenerator:
         elif self.inference_engine == "normal":
             # normal: 従来挙動（公式実装優先）
             if family == "llama":
-                return self.llama_base_vllm if is_base_model else self.llama_official
+                return self.llama_official
             if family == "qwen":
                 return self.qwen_official
         if family == "phi":
