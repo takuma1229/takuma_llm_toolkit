@@ -331,17 +331,17 @@ class TextGenerator:
                 return self.llama_official
             if family == "qwen":
                 return self.qwen_official
-        if family == "phi":
-            return self.phi_official
-        if family == "gemma":
-            # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
-            return self.gemma_official
-        if family == "mistral":
-            return self.mistral_official
-        if family == "deepseek":
-            return self.run_deepseek
-        logger.warning("Unexpected model name: %s", model_name)
-        return _openai_wrapper
+            if family == "phi":
+                return self.phi_official
+            if family == "gemma":
+                # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
+                return self.gemma_official
+            if family == "mistral":
+                return self.mistral_official
+            if family == "deepseek":
+                return self.run_deepseek
+            logger.warning("Unexpected model name: %s", model_name)
+            return _openai_wrapper
 
     def llama_official(self, model_name: str, prompt: str) -> str:
         """Llamaの公式実装を用いてテキスト生成を行う。
@@ -828,7 +828,7 @@ class TextGenerator:
             )
 
         outputs = self.tokenizer.batch_decode(outputs)
-        return outputs[0].split("<start_of_turn>model")[-1]
+        return outputs[0].split("<start_of_turn>model")[-1].split("<end_of_turn>")[0]
 
     def mistral_official(self, model_name: str, prompt: str) -> str:
         """Mistral 公式実装（Tokenizer/Transformer/generate）で推論を行う。
