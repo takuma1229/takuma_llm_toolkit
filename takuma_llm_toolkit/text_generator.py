@@ -328,7 +328,7 @@ class TextGenerator:
         elif self.inference_engine == "normal":
             # normal: 従来挙動（公式実装優先）
             if family == "llama":
-                return self.llama_base_vllm if is_base_model else self.llama_official
+                return self.llama_official
             if family == "qwen":
                 return self.qwen_official
         if family == "phi":
@@ -740,7 +740,7 @@ class TextGenerator:
         messages = [
             {
                 "role": "system",
-                "content": "You are a medieval knight and must provide explanations to modern people.",
+                "content": "You are a helpful assistant.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -779,11 +779,13 @@ class TextGenerator:
         - モデル重みは ``bfloat16``、デバイス割当は ``device_map=\"auto\"`` を採用します。
         """
 
-        model = Gemma3ForCausalLM.from_pretrained(
-            model_name, device_map="auto", torch_dtype=torch.bfloat16
-        )
+        if self.model is None:
+            self.model = Gemma3ForCausalLM.from_pretrained(
+                model_name, device_map="auto", torch_dtype=torch.bfloat16
+            )
 
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         messages = [
             [
@@ -803,19 +805,19 @@ class TextGenerator:
         ]
 
         inputs = (
-            tokenizer.apply_chat_template(
+            self.tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
                 return_tensors="pt",
             )
-            .to(model.device)
+            .to(self.model.device)
             .to(torch.bfloat16)
         )
 
         with torch.inference_mode():
-            outputs = model.generate(
+            outputs = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=self.do_sample,
@@ -825,7 +827,7 @@ class TextGenerator:
                 top_k=self.top_k,
             )
 
-        outputs = tokenizer.batch_decode(outputs)
+        outputs = self.tokenizer.batch_decode(outputs)
         return outputs[0].split("<start_of_turn>model")[-1]
 
     def mistral_official(self, model_name: str, prompt: str) -> str:
@@ -893,7 +895,8 @@ class TextGenerator:
             llm_kwargs["max_seq_len"] = int(self.max_model_len)
 
         # note that running this model on GPU requires over 60 GB of GPU RAM
-        llm = self._safe_create_llm(llm_kwargs)
+        if self.model is None:
+            self.model: LLM = self._safe_create_llm(llm_kwargs)
 
         sampling_params = SamplingParams(
             max_tokens=self.max_new_tokens,
@@ -902,7 +905,7 @@ class TextGenerator:
             top_k=self.top_k,
             repetition_penalty=self.repetition_penalty,
         )
-        outputs = llm.chat(messages, sampling_params=sampling_params)
+        outputs = self.model.chat(messages, sampling_params=sampling_params)
 
         return outputs[0].outputs[0].text
 
@@ -1044,16 +1047,17 @@ class TextGenerator:
         # モデル/トークナイザ読み込み（量子化が可能なら利用）。
         # DeepSeek-V3 は finegrained-FP8 量子化のため、GPU の SM が 8.9 未満だと失敗します。
         try:
-            model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                **(
-                    {"quantization_config": self.quantization_config}
-                    if self.quantization_config
-                    else {}
-                ),
-            )
+            if self.model is None:
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.bfloat16,
+                    device_map="auto",
+                    **(
+                        {"quantization_config": self.quantization_config}
+                        if self.quantization_config
+                        else {}
+                    ),
+                )
         except Exception as e:
             msg = str(e)
             if "FP8 quantized models is only supported" in msg:
@@ -1070,7 +1074,9 @@ class TextGenerator:
                     "3) vLLM + 対応環境に切替。"
                 ) from e
             raise
-        tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+        if self.tokenizer is None:
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
 
         # 可能ならチャットテンプレートで整形
         messages = [
@@ -1078,15 +1084,15 @@ class TextGenerator:
             {"role": "user", "content": prompt},
         ]
         try:
-            text = tokenizer.apply_chat_template(
+            text = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
         except Exception:
             text = prompt
 
-        inputs = tokenizer([text], return_tensors="pt").to(model.device)
+        inputs = self.tokenizer([text], return_tensors="pt").to(self.model.device)
         with torch.inference_mode():
-            generated = model.generate(
+            generated = self.model.generate(
                 **inputs,
                 max_new_tokens=self.max_new_tokens,
                 do_sample=self.do_sample,
@@ -1096,7 +1102,7 @@ class TextGenerator:
                 top_k=self.top_k,
             )
         gen = generated[0, inputs["input_ids"].shape[-1] :]
-        return tokenizer.decode(gen, skip_special_tokens=True)
+        return self.tokenizer.decode(gen, skip_special_tokens=True)
 
     def deepseek_vllm(self, model_name: str, prompt: str) -> str:
         """vLLM を用いて DeepSeek のテキスト生成を行う。
