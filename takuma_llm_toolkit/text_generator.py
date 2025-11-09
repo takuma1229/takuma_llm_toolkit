@@ -828,7 +828,7 @@ class TextGenerator:
             )
 
         outputs = self.tokenizer.batch_decode(outputs)
-        return outputs[0].split("<start_of_turn>model")[-1]
+        return outputs[0].split("<start_of_turn>model")[-1].split("<end_of_turn>")[0]
 
     def mistral_official(self, model_name: str, prompt: str) -> str:
         """Mistral 公式実装（Tokenizer/Transformer/generate）で推論を行う。
