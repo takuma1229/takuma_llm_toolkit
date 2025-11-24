@@ -788,29 +788,16 @@ class TextGenerator:
 
         self._require_hf_token()
         if self.pipeline is None:
-            model_kwargs: Dict[str, Any] = {
-                "dtype": torch.bfloat16,
-            }
-            if self.quantization_config:
-                model_kwargs["quantization_config"] = self.quantization_config
             try:
                 self.pipeline = transformers.pipeline(
                     "text-generation",
                     model=model_name,
-                    model_kwargs=model_kwargs,
+                    torch_dtype=torch.bfloat16,
                     device_map="auto",
                 )
             except Exception as e:
-                logger.warning(
-                    "Zephyr モデルの量子化ロードに失敗したため、非量子化で再試行します: %s",
-                    e,
-                )
-                self.pipeline = transformers.pipeline(
-                    "text-generation",
-                    model=model_name,
-                    model_kwargs={"dtype": torch.bfloat16},
-                    device_map="auto",
-                )
+                logger.warning("Zephyr モデルのロードに失敗しました: %s", e)
+                raise
 
         messages = [
             {
