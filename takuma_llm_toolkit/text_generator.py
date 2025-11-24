@@ -255,6 +255,8 @@ class TextGenerator:
         # 優先度: deepseek を先に判定（例: DeepSeek-R1-Distill-Llama-*）
         if "deepseek" in name:
             return "deepseek"
+        if "zephyr" in name:
+            return "zephyr"
         if "llama" in name:
             return "llama"
         if "qwen" in name:
@@ -305,6 +307,11 @@ class TextGenerator:
                     "phi 系で vLLM は未対応のため、公式実装へフォールバックします。"
                 )
                 return self.phi_official
+            if family == "zephyr":
+                logger.warning(
+                    "zephyr 系は vLLM 未対応のため、公式実装へフォールバックします。"
+                )
+                return self.zephyr_official
             if family == "gemma":
                 logger.warning(
                     "gemma 系で vLLM はまだ私が実装していないため、公式実装へフォールバックします。"
@@ -333,6 +340,8 @@ class TextGenerator:
                 return self.qwen_official
             if family == "phi":
                 return self.phi_official
+            if family == "zephyr":
+                return self.zephyr_official
             if family == "gemma":
                 # Gemma 系は公式実装（transformers/Gemma3ForConditionalGeneration）で推論
                 return self.gemma_official
@@ -755,6 +764,84 @@ class TextGenerator:
             top_k=self.top_k,
         )
         return outputs[0]["generated_text"][-1]["content"]
+
+    def zephyr_official(self, model_name: str, prompt: str) -> str:
+        """Zephyr 系モデルを公式 transformers パイプラインで実行する。
+
+        Parameters
+        ----------
+        model_name : str
+            使用する Zephyr モデルのリポジトリ名（例: ``"HuggingFaceH4/zephyr-7b-beta"``）。
+        prompt : str
+            ユーザー入力のテキスト。
+
+        Returns
+        -------
+        str
+            生成結果のテキスト。
+
+        Notes
+        -----
+        - モデルは ``torch.bfloat16`` でロードし、GPU があれば ``device_map="auto"`` で配置します。
+        - チャットテンプレートを文字列化した上で ``pipeline`` に渡し、生成済み文から入力プロンプト部分を取り除いて返します。
+        """
+
+        self._require_hf_token()
+        if self.pipeline is None:
+            model_kwargs: Dict[str, Any] = {
+                "dtype": torch.bfloat16,
+            }
+            if self.quantization_config:
+                model_kwargs["quantization_config"] = self.quantization_config
+            try:
+                self.pipeline = transformers.pipeline(
+                    "text-generation",
+                    model=model_name,
+                    model_kwargs=model_kwargs,
+                    device_map="auto",
+                )
+            except Exception as e:
+                logger.warning(
+                    "Zephyr モデルの量子化ロードに失敗したため、非量子化で再試行します: %s",
+                    e,
+                )
+                self.pipeline = transformers.pipeline(
+                    "text-generation",
+                    model=model_name,
+                    model_kwargs={"dtype": torch.bfloat16},
+                    device_map="auto",
+                )
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant.",
+            },
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            prompt_text = self.pipeline.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            prompt_text = prompt
+
+        outputs = self.pipeline(
+            prompt_text,
+            max_new_tokens=self.max_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.temprature,
+            repetition_penalty=self.repetition_penalty,
+            top_p=self.top_p,
+            top_k=self.top_k,
+        )
+        generated_text = outputs[0]["generated_text"]
+        if not isinstance(generated_text, str):
+            return str(generated_text)
+
+        if generated_text.startswith(prompt_text):
+            return generated_text[len(prompt_text) :].strip()
+        return generated_text
 
     def gemma_official(self, model_name: str, prompt: str) -> str:
         """Gemma 3（Instruction/Turbo等）の公式実装でテキストを生成する。
