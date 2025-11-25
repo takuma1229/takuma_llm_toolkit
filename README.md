@@ -15,7 +15,9 @@
 
 ### 最新バージョンへのアップデート (クライアント側)
 ```bash
-pip install -U "git+ssh://git@github.com/takuma1229/takuma_llm_toolkit.git"
+$ pip install -U "git+ssh://git@github.com/takuma1229/takuma_llm_toolkit.git"
+$ uv lock --upgrade-package takuma-llm-toolkit
+$ uv sync
 ```
 
 ### 環境変数（APIキー等）
