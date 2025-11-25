@@ -831,12 +831,13 @@ class TextGenerator:
             top_p=self.top_p,
             top_k=self.top_k,
         )
-        generated_text = outputs[0]["generated_text"]
+        generated_text = outputs[0]["generated_text"].split("<|assistant|>")[-1]
         if not isinstance(generated_text, str):
             return str(generated_text)
 
         if generated_text.startswith(prompt_text):
             return generated_text[len(prompt_text) :].strip()
+
         return generated_text
 
     def starchat_official(self, model_name: str, prompt: str) -> str:
