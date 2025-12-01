@@ -81,6 +81,32 @@ response = gen.run(
 print(response)
 ```
 
+### 埋め込み生成の例
+
+```python
+from takuma_llm_toolkit import EmbeddingGenerator
+
+embedder = EmbeddingGenerator(
+    model_name="Qwen/Qwen3-Embedding-8B",  # 省略時はこのモデルが既定
+    max_length=512,
+    normalize=True,
+)
+
+vector = embedder.embed("分散表現を生成するサンプルテキスト")
+print(len(vector))  # 例: 1,536 次元
+```
+
+CLI で試す場合は `run_embedding.py` を利用できます。
+
+```bash
+python run_embedding.py "Qwen/Qwen3-Embedding-8B" "埋め込みを生成したい文章"
+# 標準入力から渡すことも可能:
+echo "標準入力の例" | python run_embedding.py
+# 類似度を計算（s1, s2 の 2 文を渡す）
+python run_embedding.py --mode sim "文章1" "文章2"
+echo -e "一行目\n二行目" | python run_embedding.py --mode sim
+```
+
 ### 対応モデルとルーティング方針（重要）
 
 - Llama 系
